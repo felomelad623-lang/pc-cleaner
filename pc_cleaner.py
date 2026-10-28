@@ -31,13 +31,14 @@ try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
-os.system("")  # enables ANSI colors in the Windows console
+if sys.stdout:
+    os.system("")  # enables ANSI colors in the Windows console
 
 REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "1.0"
+VERSION = "2.0"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -357,22 +358,23 @@ def ver_tuple(v: str):
     return tuple(int(x) for x in v.split("."))
 
 
-def check_self_update() -> bool:
-    """Offer a new .exe if one exists. Returns True if the program should close now."""
+def find_update():
+    """Return (version, sha) if a newer .exe exists on your GitHub, else None."""
     if not UPDATES_ENABLED or not getattr(sys, "frozen", False):
-        return False
+        return None
     info = fetch_json("version.json")
     if not isinstance(info, dict):
-        return False
+        return None
     new, sha = info.get("version"), str(info.get("sha256", "")).lower()
     if not (isinstance(new, str) and re.fullmatch(r"\d+(\.\d+)*", new) and re.fullmatch(r"[0-9a-f]{64}", sha)):
-        return False
+        return None
     if ver_tuple(new) <= ver_tuple(VERSION):
-        return False
-    print(f"\nNew version available: {new} (you have {VERSION}).")
-    if input("Download and install it now? (y/n): ").strip().lower() != "y":
-        return False
+        return None
+    return new, sha
 
+
+def install_update(new: str, sha: str) -> bool:
+    """Download the new .exe, check its fingerprint, swap it in. True = program must close now."""
     # The download address is built from YOUR repo only, never taken from the internet.
     url = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/download/v{new}/pc_cleaner.exe"
     new_exe = os.path.join(tempfile.gettempdir(), "pc_cleaner_new.exe")
@@ -395,7 +397,6 @@ def check_self_update() -> bool:
         except OSError:
             pass
         return False
-
     old_exe = sys.executable
     bat = os.path.join(tempfile.gettempdir(), "pc_cleaner_update.bat")
     with open(bat, "w") as f:
@@ -408,8 +409,22 @@ def check_self_update() -> bool:
             'del "%~f0"\n'
         )
     subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)  # no console window
-    print("Updating... the program will reopen by itself.")
     return True
+
+
+def check_self_update() -> bool:
+    """Console mode: offer a new .exe. Returns True if the program should close now."""
+    found = find_update()
+    if not found:
+        return False
+    new, sha = found
+    print(f"\nNew version available: {new} (you have {VERSION}).")
+    if input("Download and install it now? (y/n): ").strip().lower() != "y":
+        return False
+    if install_update(new, sha):
+        print("Updating... the program will reopen by itself.")
+        return True
+    return False
 
 
 def path_is_allowed_for_remote(path: str) -> bool:
@@ -598,8 +613,247 @@ def main():
         input("\nPress Enter to close...")
 
 
+# ============================================================ GUI (pywebview)
+AR = {
+    "Temp files": ("ملفات مؤقتة", "ملفات مؤقتة بيعملها ويندوز والبرامج"),
+    "Browser cache": ("كاش المتصفحات", "صفحات وصور متخزنة من Chrome وEdge وFirefox. اقفل المتصفح الأول"),
+    "Thumbnails": ("الصور المصغرة", "معاينات صغيرة للملفات، وويندوز بيعملها تاني"),
+    "Error reports & dumps": ("تقارير الأعطال", "سجلات أعطال قديمة وملفات Dump"),
+    "Recent files list": ("قائمة الملفات الأخيرة", "اختصارات للملفات اللي فتحتها قريب، مش الملفات نفسها"),
+    "Recycle Bin": ("سلة المحذوفات", "ملفات اتمسحت قبل كده. مش هتقدر ترجعها"),
+    "Windows Update cleanup": ("ملفات تحديث ويندوز القديمة", "بتتنضف بأداة ويندوز نفسها. الحجم تقريبي"),
+    "Delivery Optimization": ("ملفات تحسين التسليم", "تحديثات متخزنة للمشاركة. بتتنضف بأداة ويندوز"),
+    "Windows.old": ("Windows.old (النسخة القديمة)", "نسخة ويندوز السابقة. بعد مسحها مش هتقدر ترجع للتحديث القديم"),
+    "Downloads folder": ("مجلد التنزيلات", "ملفاتك انت. هتختار بنفسك اللي يتمسح"),
+}
+
+
+class Api:
+    """Functions the web page can call. The page never sends file paths, only section names / list numbers."""
+
+    def __init__(self):
+        self.remote_loaded = False
+        self.found = None
+        self.dl_items = []
+
+    def get_state(self):
+        if not self.remote_loaded:
+            self.remote_loaded = True
+            SECTIONS.extend(load_remote_sections())
+        admin = is_admin()
+        out = []
+        for s in SECTIONS:
+            size, count = scan(s)
+            if s.kind == "cleanmgr" and size == 0 and s.name != "Windows Update cleanup":
+                continue  # e.g. no Windows.old on this PC: hide it
+            title, desc = AR.get(s.name, (s.name, s.desc))
+            out.append({"name": s.name, "title": title, "desc": desc, "level": s.level, "kind": s.kind,
+                        "size": size, "count": count, "approx": s.approx,
+                        "locked": s.kind == "cleanmgr" and not admin})
+        return {"version": VERSION, "sections": out}
+
+    def clean(self, names):
+        names = set(n for n in names if isinstance(n, str))
+        freed = skipped = 0
+        cm = []
+        admin = is_admin()
+        for s in SECTIONS:
+            if s.name not in names or s.kind == "downloads":
+                continue
+            if s.kind == "files":
+                f, _, sk = delete_files_section(s)
+                freed, skipped = freed + f, skipped + sk
+            elif s.kind == "recycle":
+                size, _ = recycle_info()
+                if empty_recycle():
+                    freed += size
+            elif s.kind == "cleanmgr" and admin:
+                cm.append(s.reg_key)
+        if cm:
+            run_cleanmgr(cm)
+        return {"freed": freed, "skipped": skipped, "windows_tool": bool(cm)}
+
+    def downloads_list(self):
+        folder = t_downloads()[0]
+        items = []
+        if os.path.isdir(folder):
+            for name in os.listdir(folder):
+                p = os.path.join(folder, name)
+                if is_reparse(p):
+                    continue
+                try:
+                    if os.path.isdir(p):
+                        items.append((p, sum(sz for _, sz in walk(p)[0]), True))
+                    else:
+                        items.append((p, os.path.getsize(p), False))
+                except OSError:
+                    continue
+        items.sort(key=lambda x: x[1], reverse=True)
+        self.dl_items = items[:40]
+        return [{"name": os.path.basename(p), "size": sz, "isdir": d} for p, sz, d in self.dl_items]
+
+    def downloads_delete(self, idxs):
+        freed = failed = 0
+        for i in idxs:
+            if not isinstance(i, int) or not (0 <= i < len(self.dl_items)):
+                continue
+            p, sz, d = self.dl_items[i]
+            try:
+                shutil.rmtree(p) if d else os.remove(p)
+                freed += sz
+            except OSError:
+                failed += 1
+        self.dl_items = []
+        return {"freed": freed, "failed": failed}
+
+    def find_update(self):
+        self.found = find_update()
+        return self.found[0] if self.found else None
+
+    def install_update(self):
+        if not self.found:
+            return False
+        ok = install_update(*self.found)
+        if ok:
+            import webview
+            webview.windows[0].destroy()
+        return ok
+
+
+HTML = r"""<!doctype html>
+<html dir="rtl" lang="ar"><head><meta charset="utf-8">
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--tx:#1b2430;--mut:#6b7686;--line:#e4e8ee;--ac:#2563eb;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#10151c;--card:#18202a;--tx:#e8edf3;--mut:#93a0b1;--line:#263140;--ac:#4f8cff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:"Segoe UI",Tahoma,sans-serif;padding:22px;font-size:15px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.top h1{margin:0;font-size:22px}.top small{color:var(--mut)}
+.hero{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
+.lbl{color:var(--mut);font-size:13px}.big{font-size:32px;font-weight:700;color:var(--ac)}
+button{font:inherit;border:0;border-radius:10px;padding:10px 18px;cursor:pointer}
+.pri{background:var(--ac);color:#fff}.pri:disabled{opacity:.45;cursor:default}
+.ghost{background:transparent;color:var(--tx);border:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.card input{width:18px;height:18px;accent-color:var(--ac)}
+.inf{flex:1;min-width:0}.inf b{display:block}.inf small{color:var(--mut)}
+.badge{font-size:12px;padding:3px 10px;border-radius:20px;white-space:nowrap}
+.badge.safe{background:#16a34a22;color:var(--ok)}.badge.caution{background:#d9770622;color:var(--warn)}.badge.risky{background:#dc262622;color:var(--bad)}
+.sz{min-width:92px;text-align:left;font-weight:600}.num{direction:ltr;unicode-bidi:isolate;display:inline-block}
+.sp{width:18px}
+#upd{display:none;background:var(--ac);color:#fff;border-radius:12px;padding:10px 14px;margin-bottom:12px;justify-content:space-between;align-items:center}
+#upd button{background:#fff;color:var(--ac)}
+#ov{display:none;position:fixed;inset:0;background:#0007;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--card);border-radius:16px;padding:20px;max-width:520px;width:100%;max-height:85vh;overflow:auto}
+.modal h3{margin-top:0}.modal ul{list-style:none;padding:0;margin:0 0 12px}
+.modal li{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.warn{background:#dc262615;color:var(--bad);border-radius:10px;padding:10px;margin-bottom:10px;font-size:14px}
+.chk{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+.row{display:flex;gap:8px;justify-content:flex-start}
+</style></head><body>
+<div class="top"><h1>منظف الكاش</h1><small id="ver"></small></div>
+<div id="upd"><span id="updt"></span><button onclick="doUpdate()">حدّث الآن</button></div>
+<div class="hero">
+  <div><div class="lbl">المساحة اللي هتتحرر</div><div class="big" id="total">جاري الفحص...</div></div>
+  <div><button class="ghost" onclick="load()">فحص من جديد</button> <button class="pri" id="go" onclick="confirmClean()" disabled>نظّف الآن</button></div>
+</div>
+<div id="list"></div>
+<div id="ov"><div class="modal" id="m"></div></div>
+<script>
+const $=id=>document.getElementById(id);
+const LV={safe:'آمن',caution:'بحذر',risky:'خطر'};
+let S=[],sel=new Set(),dl=[],dsel=new Set();
+const api=()=>window.pywebview.api;
+function fmt(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):Math.round(n))+' '+u[i]}
+const num=n=>'<span class="num">'+fmt(n)+'</span>';
+function showM(h){$('m').innerHTML=h;$('ov').style.display='flex'}
+function closeM(){$('ov').style.display='none'}
+async function load(){
+  $('total').textContent='جاري الفحص...';$('go').disabled=true;$('list').innerHTML='';
+  const st=await api().get_state();S=st.sections;$('ver').textContent='الإصدار '+st.version;
+  sel=new Set();S.forEach((s,i)=>{if(s.level!=='risky'&&s.kind!=='downloads'&&!s.locked&&(s.size>0||s.kind==='recycle'))sel.add(i)});
+  render();
+}
+function render(){
+  $('list').innerHTML=S.map((s,i)=>`<div class="card">
+    ${s.kind==='downloads'?'<span class="sp"></span>':`<input type="checkbox" ${sel.has(i)?'checked':''} ${s.locked?'disabled':''} onchange="tog(${i},this.checked)">`}
+    <div class="inf"><b>${s.title}</b><small>${s.desc}${s.locked?' — يحتاج صلاحية مدير':''}</small></div>
+    <span class="badge ${s.level}">${LV[s.level]}</span>
+    <div class="sz">${s.kind==='downloads'?'<button class="ghost" onclick="openDl()">اختر الملفات</button>':(s.approx&&s.size?'~':'')+num(s.size)}</div></div>`).join('');
+  total();
+}
+function tog(i,on){on?sel.add(i):sel.delete(i);total()}
+function total(){
+  let t=0;sel.forEach(i=>t+=S[i].size);
+  $('total').innerHTML=num(t);$('go').disabled=sel.size===0;
+}
+function confirmClean(){
+  const items=[...sel].map(i=>S[i]);if(!items.length)return;
+  const risky=items.filter(s=>s.level==='risky');
+  let h=`<h3>تأكيد التنظيف</h3><ul>${items.map(s=>`<li><span>${s.title}</span><b>${num(s.size)}</b></li>`).join('')}</ul>`;
+  if(risky.length)h+=`<div class="warn">${risky.map(s=>s.desc).join('<br>')}</div><label class="chk"><input type="checkbox" onchange="$('yes').disabled=!this.checked"> فاهم إن ده مفيهوش رجوع</label>`;
+  h+=`<div class="row"><button class="pri" id="yes" ${risky.length?'disabled':''} onclick="doClean()">تأكيد ونظّف</button><button class="ghost" onclick="closeM()">إلغاء</button></div>`;
+  showM(h);
+}
+async function doClean(){
+  showM('<h3>جاري التنظيف...</h3><p>استنى لحظات، وممكن تظهر نافذة صغيرة من ويندوز.</p>');
+  const r=await api().clean([...sel].map(i=>S[i].name));
+  let h=`<h3>تم التنظيف ✅</h3><p>اتحرر حوالي <b>${num(r.freed)}</b>.</p>`;
+  if(r.windows_tool)h+='<p>أقسام ويندوز اتنضفت بأداته نفسها ومش محسوبة في الرقم ده.</p>';
+  if(r.skipped)h+=`<p>${r.skipped} ملف اتخطّى لأنه مستخدم دلوقتي، وده طبيعي.</p>`;
+  showM(h+'<div class="row"><button class="pri" onclick="closeM();load()">تمام</button></div>');
+}
+async function openDl(){
+  showM('<h3>جاري تحميل القايمة...</h3>');
+  dl=await api().downloads_list();dsel=new Set();drawDl(false);
+}
+function drawDl(sure){
+  if(!dl.length){showM('<h3>مجلد التنزيلات فاضي</h3><div class="row"><button class="ghost" onclick="closeM()">إغلاق</button></div>');return}
+  showM(`<h3>مجلد التنزيلات (أكبر العناصر)</h3><ul>${dl.map((d,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${dsel.has(i)?'checked':''} onchange="dtog(${i},this.checked)"> ${d.isdir?'📁 ':''}${d.name}</label><b>${num(d.size)}</b></li>`).join('')}</ul>
+  <div class="row"><button class="pri" ${dsel.size?'':'disabled'} onclick="${sure?'doDl()':'drawDl(true)'}">${sure?'متأكد؟ اضغط تاني للحذف':'حذف المحدد'}</button><button class="ghost" onclick="closeM()">إغلاق</button></div>`);
+}
+function dtog(i,on){on?dsel.add(i):dsel.delete(i);drawDl(false)}
+async function doDl(){
+  const r=await api().downloads_delete([...dsel]);
+  showM(`<h3>تم</h3><p>اتحرر <b>${num(r.freed)}</b>${r.failed?` (${r.failed} عنصر مقدرتش أمسحه)`:''}.</p><div class="row"><button class="pri" onclick="closeM();load()">تمام</button></div>`);
+}
+async function doUpdate(){
+  $('updt').textContent='جاري التحميل... الأداة هتتقفل وتفتح تاني لوحدها';
+  const ok=await api().install_update();if(!ok)$('updt').textContent='فشل التحديث، هنكمل بالنسخة الحالية';
+}
+window.addEventListener('pywebviewready',async()=>{
+  load();
+  const v=await api().find_update();
+  if(v){$('upd').style.display='flex';$('updt').textContent='فيه إصدار جديد: '+v}
+});
+</script></body></html>
+"""
+
+
+def gui_main():
+    import webview
+    webview.create_window("منظف الكاش", html=HTML, js_api=Api(), width=940, height=700, min_size=(720, 540))
+    webview.start()
+
+
+def entry():
+    if "--console" in sys.argv:
+        main()
+        return
+    try:
+        gui_main()
+    except Exception as e:
+        if getattr(sys, "frozen", False):
+            ctypes.windll.user32.MessageBoxW(
+                0, "Could not open the window.\nPlease install 'Microsoft Edge WebView2 Runtime' from Microsoft.",
+                "PC Cleaner", 0x10)
+        else:
+            print(f"GUI could not start ({e}). Using console mode.")
+            main()
+
+
 if __name__ == "__main__":
     try:
-        main()
+        entry()
     except KeyboardInterrupt:
         print("\nStopped.")
