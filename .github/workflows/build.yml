@@ -1,0 +1,62 @@
+name: Build exe
+
+# Runs every time pc_cleaner.py changes on main (or when you press "Run workflow").
+on:
+  push:
+    branches: [main]
+    paths: [pc_cleaner.py]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Read VERSION from pc_cleaner.py
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path pc_cleaner.py -Pattern '^VERSION = "(.+)"'
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build exe
+        run: pyinstaller --onefile --uac-admin --name pc_cleaner pc_cleaner.py
+
+      - name: Fingerprint (SHA-256)
+        id: hash
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\pc_cleaner.exe -Algorithm SHA256).Hash.ToLower()
+          "sha=$h" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release with the exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: PC Cleaner v${{ steps.ver.outputs.version }}
+          files: dist/pc_cleaner.exe
+
+      - name: Update version.json
+        shell: pwsh
+        run: |
+          '{"version": "${{ steps.ver.outputs.version }}", "sha256": "${{ steps.hash.outputs.sha }}"}' | Set-Content -Encoding ascii version.json
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add version.json
+          git diff --staged --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Update version.json to ${{ steps.ver.outputs.version }}"
+            git push
+          }
