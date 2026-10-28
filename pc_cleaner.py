@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, List, Optional
@@ -38,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "2.0"
+VERSION = "2.1"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -613,6 +614,93 @@ def main():
         input("\nPress Enter to close...")
 
 
+# ------------------------------------------------ restore point & quarantine
+QUARANTINE_DAYS = 14
+QROOT = os.path.join(env("LOCALAPPDATA"), "PCCleaner", "Quarantine")
+QMANIFEST = os.path.join(QROOT, "manifest.json")
+
+
+def create_restore_point() -> bool:
+    """Ask Windows for a System Restore point. Needs Administrator + System Protection turned on."""
+    if not is_admin():
+        return False
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+             "Checkpoint-Computer -Description 'PC Cleaner' -RestorePointType MODIFY_SETTINGS -WarningAction Stop"],
+            capture_output=True, timeout=180, creationflags=0x08000000)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def q_load():
+    try:
+        with open(QMANIFEST, encoding="utf-8") as f:
+            data = json.load(f)
+        return [e for e in data if isinstance(e, dict) and re.fullmatch(r"\d+_[0-9a-f]{6}", str(e.get("id", "")))]
+    except Exception:
+        return []
+
+
+def q_save(entries):
+    os.makedirs(QROOT, exist_ok=True)
+    with open(QMANIFEST, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False)
+
+
+def q_move_in(path, size, isdir, entries) -> bool:
+    """Move an item into quarantine (same drive only, so it is an instant, safe rename)."""
+    drive = lambda x: os.path.splitdrive(os.path.abspath(x))[0].lower()
+    if drive(path) != drive(QROOT):
+        return False  # different drive: refuse, so nothing is deleted without a backup
+    qid = f"{int(time.time())}_{os.urandom(3).hex()}"
+    dest_dir = os.path.join(QROOT, qid)
+    try:
+        os.makedirs(dest_dir)
+        os.rename(path, os.path.join(dest_dir, os.path.basename(path)))
+    except OSError:
+        try:
+            os.rmdir(dest_dir)
+        except OSError:
+            pass
+        return False
+    entries.append({"id": qid, "name": os.path.basename(path), "orig": path,
+                    "size": size, "isdir": isdir, "time": time.time()})
+    return True
+
+
+def q_purge_expired():
+    entries = q_load()
+    keep = []
+    for e in entries:
+        if time.time() - float(e.get("time", 0)) > QUARANTINE_DAYS * 86400:
+            shutil.rmtree(os.path.join(QROOT, e["id"]), ignore_errors=True)
+        else:
+            keep.append(e)
+    if len(keep) != len(entries):
+        q_save(keep)
+
+
+def q_restore(e) -> bool:
+    name = os.path.basename(str(e.get("name", "")))
+    src = os.path.join(QROOT, e["id"], name)
+    dest = str(e.get("orig", ""))
+    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+    if not name or not os.path.exists(src) or not os.path.normcase(os.path.abspath(dest)).startswith(home + os.sep):
+        return False
+    if os.path.exists(dest):
+        base, ext = os.path.splitext(dest)
+        dest = f"{base} (restored){ext}"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.rename(src, dest)
+        os.rmdir(os.path.join(QROOT, e["id"]))
+        return True
+    except OSError:
+        return False
+
+
 # ============================================================ GUI (pywebview)
 AR = {
     "Temp files": ("ملفات مؤقتة", "ملفات مؤقتة بيعملها ويندوز والبرامج"),
@@ -650,10 +738,15 @@ class Api:
             out.append({"name": s.name, "title": title, "desc": desc, "level": s.level, "kind": s.kind,
                         "size": size, "count": count, "approx": s.approx,
                         "locked": s.kind == "cleanmgr" and not admin})
-        return {"version": VERSION, "sections": out}
+        q_purge_expired()
+        return {"version": VERSION, "sections": out, "admin": admin,
+                "qcount": len(q_load()), "qdays": QUARANTINE_DAYS}
 
-    def clean(self, names):
+    def clean(self, names, restore_point=False):
         names = set(n for n in names if isinstance(n, str))
+        restore = "off"
+        if restore_point:
+            restore = "ok" if create_restore_point() else "failed"
         freed = skipped = 0
         cm = []
         admin = is_admin()
@@ -671,7 +764,7 @@ class Api:
                 cm.append(s.reg_key)
         if cm:
             run_cleanmgr(cm)
-        return {"freed": freed, "skipped": skipped, "windows_tool": bool(cm)}
+        return {"freed": freed, "skipped": skipped, "windows_tool": bool(cm), "restore": restore}
 
     def downloads_list(self):
         folder = t_downloads()[0]
@@ -692,19 +785,61 @@ class Api:
         self.dl_items = items[:40]
         return [{"name": os.path.basename(p), "size": sz, "isdir": d} for p, sz, d in self.dl_items]
 
-    def downloads_delete(self, idxs):
-        freed = failed = 0
+    def downloads_delete(self, idxs, keep=True):
+        freed = kept_size = kept = failed = 0
+        entries = q_load() if keep else []
         for i in idxs:
             if not isinstance(i, int) or not (0 <= i < len(self.dl_items)):
                 continue
             p, sz, d = self.dl_items[i]
+            if keep:
+                if q_move_in(p, sz, d, entries):
+                    kept, kept_size = kept + 1, kept_size + sz
+                else:
+                    failed += 1
+                continue
             try:
                 shutil.rmtree(p) if d else os.remove(p)
                 freed += sz
             except OSError:
                 failed += 1
+        if keep and kept:
+            q_save(entries)
         self.dl_items = []
-        return {"freed": freed, "failed": failed}
+        return {"freed": freed, "kept": kept, "kept_size": kept_size, "failed": failed}
+
+    def quarantine_list(self):
+        q_purge_expired()
+        out = []
+        for e in q_load():
+            left = max(0, int(QUARANTINE_DAYS - (time.time() - float(e.get("time", 0))) / 86400) + 1)
+            out.append({"id": e["id"], "name": str(e.get("name", "")), "size": e.get("size", 0),
+                        "isdir": bool(e.get("isdir")), "days_left": left})
+        return out
+
+    def quarantine_restore(self, ids):
+        ids = set(i for i in ids if isinstance(i, str))
+        entries, keep, ok, bad = q_load(), [], 0, 0
+        for e in entries:
+            if e["id"] in ids:
+                if q_restore(e):
+                    ok += 1
+                    continue
+                bad += 1
+            keep.append(e)
+        q_save(keep)
+        return {"restored": ok, "failed": bad}
+
+    def quarantine_purge(self, ids):
+        ids = set(i for i in ids if isinstance(i, str))
+        entries, keep = q_load(), []
+        for e in entries:
+            if e["id"] in ids:
+                shutil.rmtree(os.path.join(QROOT, e["id"]), ignore_errors=True)
+            else:
+                keep.append(e)
+        q_save(keep)
+        return True
 
     def find_update(self):
         self.found = find_update()
@@ -751,7 +886,7 @@ button{font:inherit;border:0;border-radius:10px;padding:10px 18px;cursor:pointer
 .chk{display:flex;gap:8px;align-items:center;margin-bottom:12px}
 .row{display:flex;gap:8px;justify-content:flex-start}
 </style></head><body>
-<div class="top"><h1>منظف الكاش</h1><small id="ver"></small></div>
+<div class="top"><h1>منظف الكاش</h1><div><button class="ghost" id="qb" onclick="openQ()">المحذوفات المحفوظة</button> <small id="ver"></small></div></div>
 <div id="upd"><span id="updt"></span><button onclick="doUpdate()">حدّث الآن</button></div>
 <div class="hero">
   <div><div class="lbl">المساحة اللي هتتحرر</div><div class="big" id="total">جاري الفحص...</div></div>
@@ -762,7 +897,8 @@ button{font:inherit;border:0;border-radius:10px;padding:10px 18px;cursor:pointer
 <script>
 const $=id=>document.getElementById(id);
 const LV={safe:'آمن',caution:'بحذر',risky:'خطر'};
-let S=[],sel=new Set(),dl=[],dsel=new Set();
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let S=[],sel=new Set(),dl=[],dsel=new Set(),keepDl=true,ADMIN=false,QD=14,ql=[],qsel=new Set();
 const api=()=>window.pywebview.api;
 function fmt(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):Math.round(n))+' '+u[i]}
 const num=n=>'<span class="num">'+fmt(n)+'</span>';
@@ -770,14 +906,15 @@ function showM(h){$('m').innerHTML=h;$('ov').style.display='flex'}
 function closeM(){$('ov').style.display='none'}
 async function load(){
   $('total').textContent='جاري الفحص...';$('go').disabled=true;$('list').innerHTML='';
-  const st=await api().get_state();S=st.sections;$('ver').textContent='الإصدار '+st.version;
+  const st=await api().get_state();S=st.sections;ADMIN=st.admin;QD=st.qdays;
+  $('ver').textContent='الإصدار '+st.version;$('qb').textContent='المحذوفات المحفوظة ('+st.qcount+')';
   sel=new Set();S.forEach((s,i)=>{if(s.level!=='risky'&&s.kind!=='downloads'&&!s.locked&&(s.size>0||s.kind==='recycle'))sel.add(i)});
   render();
 }
 function render(){
   $('list').innerHTML=S.map((s,i)=>`<div class="card">
     ${s.kind==='downloads'?'<span class="sp"></span>':`<input type="checkbox" ${sel.has(i)?'checked':''} ${s.locked?'disabled':''} onchange="tog(${i},this.checked)">`}
-    <div class="inf"><b>${s.title}</b><small>${s.desc}${s.locked?' — يحتاج صلاحية مدير':''}</small></div>
+    <div class="inf"><b>${esc(s.title)}</b><small>${esc(s.desc)}${s.locked?' — يحتاج صلاحية مدير':''}</small></div>
     <span class="badge ${s.level}">${LV[s.level]}</span>
     <div class="sz">${s.kind==='downloads'?'<button class="ghost" onclick="openDl()">اختر الملفات</button>':(s.approx&&s.size?'~':'')+num(s.size)}</div></div>`).join('');
   total();
@@ -790,15 +927,19 @@ function total(){
 function confirmClean(){
   const items=[...sel].map(i=>S[i]);if(!items.length)return;
   const risky=items.filter(s=>s.level==='risky');
-  let h=`<h3>تأكيد التنظيف</h3><ul>${items.map(s=>`<li><span>${s.title}</span><b>${num(s.size)}</b></li>`).join('')}</ul>`;
-  if(risky.length)h+=`<div class="warn">${risky.map(s=>s.desc).join('<br>')}</div><label class="chk"><input type="checkbox" onchange="$('yes').disabled=!this.checked"> فاهم إن ده مفيهوش رجوع</label>`;
+  let h=`<h3>تأكيد التنظيف</h3><ul>${items.map(s=>`<li><span>${esc(s.title)}</span><b>${num(s.size)}</b></li>`).join('')}</ul>`;
+  if(risky.length)h+=`<div class="warn">${risky.map(s=>esc(s.desc)).join('<br>')}</div><label class="chk"><input type="checkbox" onchange="$('yes').disabled=!this.checked"> فاهم إن ده مفيهوش رجوع</label>`;
+  h+=`<label class="chk"><input type="checkbox" id="rp" ${ADMIN?'checked':'disabled'}> إنشاء نقطة استعادة ويندوز قبل التنظيف${ADMIN?'':' (يحتاج صلاحية مدير)'}</label>`;
   h+=`<div class="row"><button class="pri" id="yes" ${risky.length?'disabled':''} onclick="doClean()">تأكيد ونظّف</button><button class="ghost" onclick="closeM()">إلغاء</button></div>`;
   showM(h);
 }
 async function doClean(){
-  showM('<h3>جاري التنظيف...</h3><p>استنى لحظات، وممكن تظهر نافذة صغيرة من ويندوز.</p>');
-  const r=await api().clean([...sel].map(i=>S[i].name));
+  const rp=!!($('rp')&&$('rp').checked);
+  showM('<h3>جاري التنظيف...</h3><p>'+(rp?'بنعمل نقطة استعادة الأول، وده ممكن ياخد دقيقة. ':'')+'استنى لحظات، وممكن تظهر نافذة صغيرة من ويندوز.</p>');
+  const r=await api().clean([...sel].map(i=>S[i].name),rp);
   let h=`<h3>تم التنظيف ✅</h3><p>اتحرر حوالي <b>${num(r.freed)}</b>.</p>`;
+  if(r.restore==='ok')h+='<p>اتعملت نقطة استعادة في ويندوز.</p>';
+  if(r.restore==='failed')h+='<p>⚠️ مقدرتش أعمل نقطة استعادة (ممكن اتعملت واحدة النهاردة، أو حماية النظام مقفولة). التنظيف اتم عادي.</p>';
   if(r.windows_tool)h+='<p>أقسام ويندوز اتنضفت بأداته نفسها ومش محسوبة في الرقم ده.</p>';
   if(r.skipped)h+=`<p>${r.skipped} ملف اتخطّى لأنه مستخدم دلوقتي، وده طبيعي.</p>`;
   showM(h+'<div class="row"><button class="pri" onclick="closeM();load()">تمام</button></div>');
@@ -809,13 +950,35 @@ async function openDl(){
 }
 function drawDl(sure){
   if(!dl.length){showM('<h3>مجلد التنزيلات فاضي</h3><div class="row"><button class="ghost" onclick="closeM()">إغلاق</button></div>');return}
-  showM(`<h3>مجلد التنزيلات (أكبر العناصر)</h3><ul>${dl.map((d,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${dsel.has(i)?'checked':''} onchange="dtog(${i},this.checked)"> ${d.isdir?'📁 ':''}${d.name}</label><b>${num(d.size)}</b></li>`).join('')}</ul>
-  <div class="row"><button class="pri" ${dsel.size?'':'disabled'} onclick="${sure?'doDl()':'drawDl(true)'}">${sure?'متأكد؟ اضغط تاني للحذف':'حذف المحدد'}</button><button class="ghost" onclick="closeM()">إغلاق</button></div>`);
+  showM(`<h3>مجلد التنزيلات (أكبر العناصر)</h3><ul>${dl.map((d,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${dsel.has(i)?'checked':''} onchange="dtog(${i},this.checked)"> ${d.isdir?'📁 ':''}${esc(d.name)}</label><b>${num(d.size)}</b></li>`).join('')}</ul>
+  <label class="chk"><input type="checkbox" ${keepDl?'checked':''} onchange="keepDl=this.checked;drawDl(false)"> احتفظ بنسخة ${QD} يوم عشان أقدر أرجعها (موصى بيه)</label>
+  <div class="row"><button class="pri" ${dsel.size?'':'disabled'} onclick="${sure?'doDl()':'drawDl(true)'}">${sure?(keepDl?'متأكد؟ اضغط تاني للنقل':'متأكد؟ اضغط تاني للحذف النهائي'):(keepDl?'احذف المحدد':'حذف نهائي للمحدد')}</button><button class="ghost" onclick="closeM()">إغلاق</button></div>`);
 }
 function dtog(i,on){on?dsel.add(i):dsel.delete(i);drawDl(false)}
 async function doDl(){
-  const r=await api().downloads_delete([...dsel]);
-  showM(`<h3>تم</h3><p>اتحرر <b>${num(r.freed)}</b>${r.failed?` (${r.failed} عنصر مقدرتش أمسحه)`:''}.</p><div class="row"><button class="pri" onclick="closeM();load()">تمام</button></div>`);
+  const r=await api().downloads_delete([...dsel],keepDl);
+  let h='<h3>تم</h3>';
+  if(r.kept)h+=`<p>اتنقل ${r.kept} عنصر (${num(r.kept_size)}) للمحذوفات المحفوظة لمدة ${QD} يوم. تقدر ترجعهم من زرار "المحذوفات المحفوظة" فوق. المساحة هتتحرر بعد ما تتمسح نهائي.</p>`;
+  if(r.freed)h+=`<p>اتحرر <b>${num(r.freed)}</b> نهائي.</p>`;
+  if(r.failed)h+=`<p>${r.failed} عنصر معرفتش أتعامل معاه (مستخدم دلوقتي، أو على درايف مختلف). مفيش حاجة اتمسحت منهم.</p>`;
+  showM(h+'<div class="row"><button class="pri" onclick="closeM();load()">تمام</button></div>');
+}
+async function openQ(){showM('<h3>جاري التحميل...</h3>');ql=await api().quarantine_list();qsel=new Set();drawQ()}
+function drawQ(){
+  if(!ql.length){showM('<h3>المحذوفات المحفوظة</h3><p>مفيش حاجة محفوظة دلوقتي.</p><div class="row"><button class="ghost" onclick="closeM();load()">إغلاق</button></div>');return}
+  showM(`<h3>المحذوفات المحفوظة</h3><p class="lbl">بتتمسح لوحدها بعد ${QD} يوم.</p><ul>${ql.map((q,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${qsel.has(i)?'checked':''} onchange="qtog(${i},this.checked)"> ${q.isdir?'📁 ':''}${esc(q.name)}</label><span><b>${num(q.size)}</b> · باقي ${q.days_left} يوم</span></li>`).join('')}</ul>
+  <div class="row"><button class="pri" ${qsel.size?'':'disabled'} onclick="qRestore()">استرجاع المحدد</button><button class="ghost" ${qsel.size?'':'disabled'} onclick="qPurge()">مسح نهائي</button><button class="ghost" onclick="closeM();load()">إغلاق</button></div>`);
+}
+function qtog(i,on){on?qsel.add(i):qsel.delete(i);drawQ()}
+async function qRestore(){
+  const r=await api().quarantine_restore([...qsel].map(i=>ql[i].id));
+  ql=await api().quarantine_list();qsel=new Set();drawQ();
+  if(r.failed)alert('مقدرتش أرجع '+r.failed+' عنصر');
+}
+async function qPurge(){
+  if(!confirm('المسح ده نهائي ومفيهوش رجوع. متأكد؟'))return;
+  await api().quarantine_purge([...qsel].map(i=>ql[i].id));
+  ql=await api().quarantine_list();qsel=new Set();drawQ();
 }
 async function doUpdate(){
   $('updt').textContent='جاري التحميل... الأداة هتتقفل وتفتح تاني لوحدها';
