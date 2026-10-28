@@ -21,8 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyInstaller
-        run: pip install pyinstaller
-
+        run: pip install pyinstaller pywebview
       - name: Read VERSION from pc_cleaner.py
         id: ver
         shell: pwsh
@@ -32,7 +31,7 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build exe
-        run: pyinstaller --onefile --uac-admin --name pc_cleaner pc_cleaner.py
+        run: pyinstaller --onefile --noconsole --uac-admin --collect-all webview --name pc_cleaner pc_cleaner.py
 
       - name: Fingerprint (SHA-256)
         id: hash
