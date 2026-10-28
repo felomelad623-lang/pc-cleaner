@@ -39,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "2.1"
+VERSION = "2.2"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -701,6 +701,88 @@ def q_restore(e) -> bool:
         return False
 
 
+# ------------------------------------------------------- winget apps & prefs
+# The list is fixed inside the exe. The page only ever sends a key from this list,
+# never an ID or a command, so nothing else can be installed.
+APPS = [  # (key, group, name, winget id, note)
+    ("chrome", "المتصفحات", "Google Chrome", "Google.Chrome", ""),
+    ("firefox", "المتصفحات", "Mozilla Firefox", "Mozilla.Firefox", ""),
+    ("brave", "المتصفحات", "Brave", "Brave.Brave", ""),
+    ("vlc", "الميديا", "VLC", "VideoLAN.VLC", ""),
+    ("klite", "الميديا", "K-Lite Codec Pack (Full)", "CodecGuide.K-LiteCodecPack.Full", ""),
+    ("7zip", "الضغط", "7-Zip", "7zip.7zip", ""),
+    ("winrar", "الضغط", "WinRAR", "RARLab.WinRAR", "برنامج مدفوع وبيشتغل بفترة تجربة"),
+    ("telegram", "التواصل", "Telegram", "Telegram.TelegramDesktop", ""),
+    ("whatsapp", "التواصل", "WhatsApp", "WhatsApp.WhatsApp", "من متجر مايكروسوفت، وممكن يفشل على بعض الأجهزة"),
+    ("discord", "التواصل", "Discord", "Discord.Discord", ""),
+    ("foxit", "قارئ PDF", "Foxit PDF Reader", "Foxit.FoxitReader", ""),
+    ("adobe", "قارئ PDF", "Adobe Acrobat Reader (64-bit)", "Adobe.Acrobat.Reader.64-bit", ""),
+    ("vcredist", "حزم الألعاب", "Visual C++ 2015-2022 (x64)", "Microsoft.VCRedist.2015+.x64", ""),
+    ("directx", "حزم الألعاب", "DirectX End-User Runtime", "Microsoft.DirectX", ""),
+    ("anydesk", "أدوات", "AnyDesk", "AnyDesk.AnyDesk", ""),
+    ("idm", "أدوات", "Internet Download Manager", "Tonec.InternetDownloadManager", "برنامج مدفوع وبيشتغل بفترة تجربة"),
+]
+APP_BY_KEY = {a[0]: a for a in APPS}
+NO_SOURCE_FLAG = {"whatsapp"}                 # Store-based package: let winget pick the source
+WINGET_ALREADY = {0x8A15002B, 0x8A150061}     # "already installed" / "no newer version"
+WINGET_TIMEOUT = 1800                         # seconds per program
+
+PREFS = os.path.join(env("LOCALAPPDATA"), "PCCleaner", "prefs.json")
+
+
+def prefs_load() -> dict:
+    try:
+        with open(PREFS, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def prefs_save(d: dict):
+    try:
+        os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+        with open(PREFS, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+def find_winget() -> Optional[str]:
+    p = shutil.which("winget")
+    if p:
+        return p
+    cand = os.path.join(env("LOCALAPPDATA"), "Microsoft", "WindowsApps", "winget.exe")
+    return cand if os.path.exists(cand) else None
+
+
+def winget_install(key: str):
+    """Install one program silently. Returns (state, code): state is ok | had | fail."""
+    app = APP_BY_KEY.get(key)
+    if not app:
+        return "fail", "bad-key"
+    exe = find_winget()
+    if not exe:
+        return "fail", "no-winget"
+    cmd = [exe, "install", "--id", app[3], "-e", "--silent",
+           "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
+    if key not in NO_SOURCE_FLAG:
+        cmd += ["--source", "winget"]
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=WINGET_TIMEOUT, creationflags=0x08000000)
+    except subprocess.TimeoutExpired:
+        return "fail", "timeout"
+    except Exception:
+        return "fail", "error"
+    code = r.returncode & 0xFFFFFFFF
+    if code == 0:
+        return "ok", ""
+    if code in WINGET_ALREADY:
+        return "had", ""
+    return "fail", f"0x{code:08X}"
+
+
 # ============================================================ GUI (pywebview)
 AR = {
     "Temp files": ("ملفات مؤقتة", "ملفات مؤقتة بيعملها ويندوز والبرامج"),
@@ -740,7 +822,8 @@ class Api:
                         "locked": s.kind == "cleanmgr" and not admin})
         q_purge_expired()
         return {"version": VERSION, "sections": out, "admin": admin,
-                "qcount": len(q_load()), "qdays": QUARANTINE_DAYS}
+                "qcount": len(q_load()), "qdays": QUARANTINE_DAYS,
+                "theme": prefs_load().get("theme") if prefs_load().get("theme") in ("light", "dark") else ""}
 
     def clean(self, names, restore_point=False):
         names = set(n for n in names if isinstance(n, str))
@@ -841,6 +924,23 @@ class Api:
         q_save(keep)
         return True
 
+    def get_apps(self):
+        return {"winget": find_winget() is not None,
+                "apps": [{"key": a[0], "group": a[1], "name": a[2], "note": a[4]} for a in APPS]}
+
+    def install_app(self, key):
+        if not isinstance(key, str):
+            return {"state": "fail", "code": "bad-key"}
+        state, code = winget_install(key)
+        return {"state": state, "code": code}
+
+    def set_theme(self, t):
+        if t in ("light", "dark"):
+            p = prefs_load()
+            p["theme"] = t
+            prefs_save(p)
+        return True
+
     def find_update(self):
         self.found = find_update()
         return self.found[0] if self.found else None
@@ -858,55 +958,133 @@ class Api:
 HTML = r"""<!doctype html>
 <html dir="rtl" lang="ar"><head><meta charset="utf-8">
 <style>
-:root{--bg:#f4f6f9;--card:#fff;--tx:#1b2430;--mut:#6b7686;--line:#e4e8ee;--ac:#2563eb;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
-@media(prefers-color-scheme:dark){:root{--bg:#10151c;--card:#18202a;--tx:#e8edf3;--mut:#93a0b1;--line:#263140;--ac:#4f8cff}}
+:root{--bg:#eef2f6;--side:#12283d;--stx:#c9d8e6;--card:#fff;--tx:#14232e;--mut:#5f6d7c;--line:#dce3ea;--ac:#0f766e;--acx:#fff;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--sh:0 8px 20px #12283d22}
+:root[data-theme=dark]{--bg:#0d141b;--side:#0a1219;--stx:#9fb2c4;--card:#161f29;--tx:#e6edf3;--mut:#8a9aab;--line:#243140;--ac:#2dd4bf;--acx:#062b27;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--sh:0 8px 20px #0009}
+@media(prefers-color-scheme:dark){:root:not([data-theme]){--bg:#0d141b;--side:#0a1219;--stx:#9fb2c4;--card:#161f29;--tx:#e6edf3;--mut:#8a9aab;--line:#243140;--ac:#2dd4bf;--acx:#062b27;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--sh:0 8px 20px #0009}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font-family:"Segoe UI",Tahoma,sans-serif;padding:22px;font-size:15px}
-.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-.top h1{margin:0;font-size:22px}.top small{color:var(--mut)}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:"Segoe UI",Tahoma,sans-serif;font-size:15px;display:flex}
+aside{width:210px;flex:none;height:100vh;background:var(--side);color:var(--stx);display:flex;flex-direction:column;padding:18px 12px;gap:6px}
+.brand{font-size:19px;font-weight:700;color:#fff;padding:2px 10px 16px}
+.tab{display:flex;align-items:center;gap:10px;width:100%;text-align:right;background:transparent;color:var(--stx);padding:11px 12px;border-radius:10px}
+.tab:hover{background:#ffffff14;transform:translateX(-2px)}
+.tab.on{background:var(--ac);color:var(--acx);font-weight:600}
+.sfoot{margin-top:auto;display:flex;flex-direction:column;gap:8px}
+.sfoot button{background:#ffffff12;color:var(--stx);text-align:right}
+.sfoot button:hover{background:#ffffff22}
+.sfoot small{padding:0 10px;opacity:.75}
+main{flex:1;min-width:0;height:100vh;overflow:auto;padding:22px 26px}
+.pane{display:none}
+.pane.on{display:block;animation:in .22s ease}
+@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px}
+.head h1{margin:0 0 4px;font-size:22px}
+.lbl{color:var(--mut);font-size:13px}
 .hero{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
-.lbl{color:var(--mut);font-size:13px}.big{font-size:32px;font-weight:700;color:var(--ac)}
-button{font:inherit;border:0;border-radius:10px;padding:10px 18px;cursor:pointer}
-.pri{background:var(--ac);color:#fff}.pri:disabled{opacity:.45;cursor:default}
+.big{font-size:32px;font-weight:700;color:var(--ac)}
+button{font:inherit;border:0;border-radius:10px;padding:10px 18px;cursor:pointer;transition:transform .15s,background .15s,filter .15s,border-color .15s}
+button:not(:disabled):hover{transform:translateY(-1px)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.pri{background:var(--ac);color:var(--acx)}.pri:not(:disabled):hover{filter:brightness(1.1)}
+.pri:disabled{opacity:.45;cursor:default}
 .ghost{background:transparent;color:var(--tx);border:1px solid var(--line)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:12px;margin-bottom:8px}
-.card input{width:18px;height:18px;accent-color:var(--ac)}
+.ghost:not(:disabled):hover{border-color:var(--ac)}
+.ghost:disabled{opacity:.45;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:12px;margin-bottom:8px;transition:transform .15s,box-shadow .15s,border-color .15s}
+.card:hover{transform:translateY(-2px);box-shadow:var(--sh);border-color:var(--ac)}
+.card input{width:18px;height:18px;accent-color:var(--ac);flex:none}
 .inf{flex:1;min-width:0}.inf b{display:block}.inf small{color:var(--mut)}
 .badge{font-size:12px;padding:3px 10px;border-radius:20px;white-space:nowrap}
-.badge.safe{background:#16a34a22;color:var(--ok)}.badge.caution{background:#d9770622;color:var(--warn)}.badge.risky{background:#dc262622;color:var(--bad)}
+.badge:empty{display:none}
+.badge.safe{background:#16a34a22;color:var(--ok)}.badge.caution{background:#d9770622;color:var(--warn)}.badge.risky{background:#dc262622;color:var(--bad)}.badge.mut{background:var(--line);color:var(--mut)}
+.pulse{animation:pl 1.2s ease-in-out infinite}
+@keyframes pl{50%{opacity:.45}}
 .sz{min-width:92px;text-align:left;font-weight:600}.num{direction:ltr;unicode-bidi:isolate;display:inline-block}
 .sp{width:18px}
-#upd{display:none;background:var(--ac);color:#fff;border-radius:12px;padding:10px 14px;margin-bottom:12px;justify-content:space-between;align-items:center}
-#upd button{background:#fff;color:var(--ac)}
+#upd{display:none;background:var(--ac);color:var(--acx);border-radius:12px;padding:10px 14px;margin-bottom:14px;justify-content:space-between;align-items:center}
+#upd button{background:#fff;color:#0f766e}
 #ov{display:none;position:fixed;inset:0;background:#0007;align-items:center;justify-content:center;padding:20px}
-.modal{background:var(--card);border-radius:16px;padding:20px;max-width:520px;width:100%;max-height:85vh;overflow:auto}
+.modal{background:var(--card);border-radius:16px;padding:20px;max-width:520px;width:100%;max-height:85vh;overflow:auto;animation:pop .15s ease}
+@keyframes pop{from{opacity:0;transform:scale(.97)}}
 .modal h3{margin-top:0}.modal ul{list-style:none;padding:0;margin:0 0 12px}
 .modal li{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
 .warn{background:#dc262615;color:var(--bad);border-radius:10px;padding:10px;margin-bottom:10px;font-size:14px}
 .chk{display:flex;gap:8px;align-items:center;margin-bottom:12px}
 .row{display:flex;gap:8px;justify-content:flex-start}
+.bar2{display:flex;gap:8px;align-items:center;position:sticky;top:-22px;z-index:2;background:var(--bg);padding:12px 0 10px}
+.bar2 .lbl{flex:1}
+.gh{margin:16px 0 8px;font-size:15px;color:var(--mut);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}
+.grid .card{margin:0;cursor:pointer}
+.lock .card{pointer-events:none}
+.track{height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0}
+.fill{height:100%;width:0;background:var(--ac);transition:width .3s}
+#prog{margin:4px 0 6px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
-<div class="top"><h1>منظف الكاش</h1><div><button class="ghost" id="qb" onclick="openQ()">المحذوفات المحفوظة</button> <small id="ver"></small></div></div>
+<aside>
+  <div class="brand">منظف الكمبيوتر</div>
+  <button class="tab on" data-t="1" onclick="tab('1')">🧹 تنظيف وتسريع النظام</button>
+  <button class="tab" data-t="2" onclick="tab('2')">💻 تجهيز الويندوز بعد الفورمات</button>
+  <div class="sfoot">
+    <button id="thm" onclick="toggleTheme()"></button>
+    <small id="ver"></small>
+  </div>
+</aside>
+<main>
 <div id="upd"><span id="updt"></span><button onclick="doUpdate()">حدّث الآن</button></div>
-<div class="hero">
-  <div><div class="lbl">المساحة اللي هتتحرر</div><div class="big" id="total">جاري الفحص...</div></div>
-  <div><button class="ghost" onclick="load()">فحص من جديد</button> <button class="pri" id="go" onclick="confirmClean()" disabled>نظّف الآن</button></div>
-</div>
-<div id="list"></div>
+
+<section class="pane on" id="p1">
+  <div class="head"><div><h1>تنظيف وتسريع النظام</h1><div class="lbl">الأداة بتفحص بس الأماكن المعروفة إنها كاش وملفات مؤقتة.</div></div><button class="ghost" id="qb" onclick="openQ()">المحذوفات المحفوظة</button></div>
+  <div class="hero">
+    <div><div class="lbl">المساحة اللي هتتحرر</div><div class="big" id="total">جاري الفحص...</div></div>
+    <div><button class="ghost" onclick="load()">فحص من جديد</button> <button class="pri" id="go" onclick="confirmClean()" disabled>نظّف الآن</button></div>
+  </div>
+  <div id="list"></div>
+</section>
+
+<section class="pane" id="p2">
+  <div class="head"><div><h1>تجهيز الويندوز بعد الفورمات</h1><div class="lbl">اختار البرامج والأداة تثبّتها واحد ورا التاني من غير ما تفتح أي نافذة. بتتنزّل من مستودع winget الرسمي، فلازم يكون فيه إنترنت.</div></div></div>
+  <div class="warn" id="wg" style="display:none"></div>
+  <div class="bar2">
+    <button class="ghost" onclick="appsAll(true)">اختار الكل</button>
+    <button class="ghost" onclick="appsAll(false)">إلغاء الكل</button>
+    <span class="lbl" id="acount"></span>
+    <button class="pri" id="inst" onclick="startInstall()" disabled>ثبّت المختار</button>
+  </div>
+  <div id="prog" style="display:none"><div class="track"><div class="fill" id="fill"></div></div><div class="lbl" id="ptxt"></div></div>
+  <div id="apps"></div>
+</section>
+</main>
 <div id="ov"><div class="modal" id="m"></div></div>
 <script>
 const $=id=>document.getElementById(id);
 const LV={safe:'آمن',caution:'بحذر',risky:'خطر'};
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let S=[],sel=new Set(),dl=[],dsel=new Set(),keepDl=true,ADMIN=false,QD=14,ql=[],qsel=new Set();
+let A=[],asel=new Set(),WG=true,busy=false,appsLoaded=false;
 const api=()=>window.pywebview.api;
 function fmt(n){const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):Math.round(n))+' '+u[i]}
 const num=n=>'<span class="num">'+fmt(n)+'</span>';
 function showM(h){$('m').innerHTML=h;$('ov').style.display='flex'}
 function closeM(){$('ov').style.display='none'}
+
+/* ---- theme + tabs ---- */
+function curTheme(){const a=document.documentElement.getAttribute('data-theme');if(a)return a;return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}
+function themeLabel(){$('thm').textContent=curTheme()==='dark'?'☀️ الوضع الفاتح':'🌙 الوضع الداكن'}
+function setTheme(t,save){document.documentElement.setAttribute('data-theme',t);themeLabel();if(save)api().set_theme(t)}
+function toggleTheme(){setTheme(curTheme()==='dark'?'light':'dark',true)}
+function tab(n){
+  document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
+  document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p'+n));
+  if(n==='2'&&!appsLoaded)loadApps();
+}
+
+/* ---- cleaning tab ---- */
 async function load(){
   $('total').textContent='جاري الفحص...';$('go').disabled=true;$('list').innerHTML='';
   const st=await api().get_state();S=st.sections;ADMIN=st.admin;QD=st.qdays;
+  if(st.theme)setTheme(st.theme,false);else themeLabel();
   $('ver').textContent='الإصدار '+st.version;$('qb').textContent='المحذوفات المحفوظة ('+st.qcount+')';
   sel=new Set();S.forEach((s,i)=>{if(s.level!=='risky'&&s.kind!=='downloads'&&!s.locked&&(s.size>0||s.kind==='recycle'))sel.add(i)});
   render();
@@ -980,10 +1158,55 @@ async function qPurge(){
   await api().quarantine_purge([...qsel].map(i=>ql[i].id));
   ql=await api().quarantine_list();qsel=new Set();drawQ();
 }
+
+/* ---- setup tab (winget) ---- */
+const STX={wait:['في الانتظار','mut'],run:['جاري التثبيت...','caution'],ok:['اتثبّت ✅','safe'],had:['موجود قبل كده','safe'],fail:['فشل','risky']};
+function setSt(i,s,code){
+  const e=$('st'+i);if(!e)return;const [t,c]=STX[s];
+  e.className='badge '+c+(s==='run'?' pulse':'');
+  e.textContent=t+((s==='fail'&&code)?' ('+code+')':'');
+}
+async function loadApps(){
+  const r=await api().get_apps();A=r.apps;WG=r.winget;appsLoaded=true;asel=new Set();
+  const w=$('wg');
+  if(WG)w.style.display='none';
+  else{w.style.display='block';w.textContent='مش لاقي winget على الجهاز ده. محتاج ويندوز 10 (إصدار حديث) أو ويندوز 11، وبرنامج App Installer متحدّث من متجر مايكروسوفت.'}
+  renderApps();
+}
+function renderApps(){
+  const gs=[...new Set(A.map(a=>a.group))];
+  $('apps').innerHTML=gs.map(g=>{
+    const items=A.map((a,i)=>[a,i]).filter(x=>x[0].group===g);
+    return `<h3 class="gh">${esc(g)}</h3><div class="grid">${items.map(([a,i])=>`<label class="card"><input type="checkbox" ${asel.has(i)?'checked':''} ${WG?'':'disabled'} onchange="atog(${i},this.checked)"><div class="inf"><b>${esc(a.name)}</b>${a.note?`<small>${esc(a.note)}</small>`:''}</div><span class="badge" id="st${i}"></span></label>`).join('')}</div>`;
+  }).join('');
+  upd2();
+}
+function upd2(){$('acount').textContent=asel.size?('المختار: '+asel.size):'';$('inst').disabled=busy||!WG||!asel.size}
+function atog(i,on){on?asel.add(i):asel.delete(i);upd2()}
+function appsAll(on){if(busy||!WG)return;asel=new Set(on?A.map((_,i)=>i):[]);document.querySelectorAll('#apps input').forEach(c=>c.checked=on);upd2()}
+function prog(done,total,txt){$('fill').style.width=(total?Math.round(done*100/total):0)+'%';$('ptxt').textContent=txt}
+async function startInstall(){
+  if(busy||!WG||!asel.size)return;
+  const idx=[...asel].sort((a,b)=>a-b);
+  busy=true;$('apps').classList.add('lock');$('prog').style.display='block';upd2();
+  A.forEach((_,i)=>{$('st'+i).className='badge';$('st'+i).textContent=''});
+  idx.forEach(i=>setSt(i,'wait'));
+  let done=0,okc=0,bad=0;
+  for(const i of idx){
+    setSt(i,'run');prog(done,idx.length,'بنثبّت '+A[i].name+' ('+(done+1)+' من '+idx.length+')... ممكن ياخد دقايق');
+    let r;try{r=await api().install_app(A[i].key)}catch(e){r={state:'fail',code:'error'}}
+    setSt(i,r.state,r.code);
+    r.state==='fail'?bad++:okc++;done++;
+  }
+  prog(done,idx.length,'خلصنا: '+okc+' تمام'+(bad?'، و'+bad+' فشلوا (جنب كل واحد كود الخطأ). جرّب تثبّتهم تاني، ولو فشلوا ابعت الكود للمطوّر.':'. ممكن تحتاج تعيد تشغيل الجهاز.'));
+  busy=false;$('apps').classList.remove('lock');upd2();
+}
+
 async function doUpdate(){
   $('updt').textContent='جاري التحميل... الأداة هتتقفل وتفتح تاني لوحدها';
   const ok=await api().install_update();if(!ok)$('updt').textContent='فشل التحديث، هنكمل بالنسخة الحالية';
 }
+themeLabel();
 window.addEventListener('pywebviewready',async()=>{
   load();
   const v=await api().find_update();
@@ -995,7 +1218,7 @@ window.addEventListener('pywebviewready',async()=>{
 
 def gui_main():
     import webview
-    webview.create_window("منظف الكاش", html=HTML, js_api=Api(), width=940, height=700, min_size=(720, 540))
+    webview.create_window("منظف الكمبيوتر", html=HTML, js_api=Api(), width=1040, height=740, min_size=(820, 560))
     webview.start()
 
 
