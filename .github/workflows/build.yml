@@ -1,10 +1,10 @@
 name: Build exe
 
-# Runs every time pc_cleaner.py changes on main (or when you press "Run workflow").
+# Runs every time pc_cleaner.py or installer.iss changes on main (or when you press "Run workflow").
 on:
   push:
     branches: [main]
-    paths: [pc_cleaner.py]
+    paths: [pc_cleaner.py, installer.iss]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +22,7 @@ jobs:
 
       - name: Install PyInstaller
         run: pip install pyinstaller pywebview
+
       - name: Read VERSION from pc_cleaner.py
         id: ver
         shell: pwsh
@@ -31,7 +32,7 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build exe
-        run: pyinstaller --onefile --noconsole --uac-admin --collect-all webview --name pc_cleaner pc_cleaner.py
+        run: pyinstaller --onefile --noconsole --uac-admin --icon logo.ico --collect-all webview --name pc_cleaner pc_cleaner.py
 
       - name: Fingerprint (SHA-256)
         id: hash
@@ -40,12 +41,27 @@ jobs:
           $h = (Get-FileHash dist\pc_cleaner.exe -Algorithm SHA256).Hash.ToLower()
           "sha=$h" >> $env:GITHUB_OUTPUT
 
-      - name: Publish release with the exe
+      - name: Install Inno Setup (if the runner does not have it)
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup was not found after install" }
+
+      - name: Build the installer (PC_Cleaner_Setup.exe)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyVersion=${{ steps.ver.outputs.version }}" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Publish release with the exe and the installer
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: PC Cleaner v${{ steps.ver.outputs.version }}
-          files: dist/pc_cleaner.exe
+          files: |
+            dist/pc_cleaner.exe
+            Output/PC_Cleaner_Setup.exe
 
       - name: Update version.json
         shell: pwsh
