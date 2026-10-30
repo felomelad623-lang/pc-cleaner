@@ -39,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.2"
+VERSION = "3.2.1"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -406,10 +406,13 @@ def install_update(new: str, sha: str) -> bool:
             "ping -n 2 127.0.0.1 >nul\n"
             f'move /y "{new_exe}" "{old_exe}" >nul 2>&1\n'
             "if errorlevel 1 goto retry\n"
+            "set PYINSTALLER_RESET_ENVIRONMENT=1\n"
             f'start "" "{old_exe}"\n'
             'del "%~f0"\n'
         )
-    subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)  # no console window
+    env_clean = {k: v for k, v in os.environ.items() if not k.startswith("_PYI")}
+    env_clean["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # the new exe must start as a fresh app, not a child of this one
+    subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000, env=env_clean)  # no console window
     return True
 
 
@@ -1586,6 +1589,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <div class="sp" id="sp-set">
     <div class="soon"><div class="ic ic3" style="margin:0 auto"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></div><h3 data-i="set_soon_title"></h3><div class="lbl" data-i="set_soon_txt"></div></div>
   </div>
+</section>
 
 <section class="pane" id="p3">
   <div class="head"><div><h1 data-i="un_title"></h1></div></div>
@@ -1753,15 +1757,15 @@ async function doUninstall(id){
   h+=`<div class="row"><button class="ghost" onclick="openLeftovers('${id}')">${L('un_leftovers_btn')}</button><button class="pri" onclick="closeM();loadPrograms()">${L('ok')}</button></div>`;
   showM(h);
 }
-let LSEL=new Set(),LITEMS=[];
+let LSEL=new Set(),LITEMS=[],LNAME='';
 async function openLeftovers(id){
+  const pp=PROGS.find(x=>x.id===id);LNAME=pp?pp.name:'';
   showM('<h3>'+L('un_leftovers_loading')+'</h3>');
   LITEMS=await api().scan_leftovers(id);LSEL=new Set();drawLeftovers();
 }
 function drawLeftovers(){
-  const p=PROGS.find(x=>PROGS.some(y=>y===x));
-  if(!LITEMS.length){showM(`<h3>${L('un_leftovers_title','')}</h3><p class="lbl">${L('un_leftovers_empty')}</p><div class="row"><button class="ghost" onclick="closeM();loadPrograms()">${L('close')}</button></div>`);return}
-  showM(`<h3>${L('un_leftovers_title','')}</h3><ul>${LITEMS.map((it,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${LSEL.has(i)?'checked':''} onchange="ltog(${i},this.checked)"> ${esc(it.path)}</label><b>${num(it.size)}</b></li>`).join('')}</ul>
+  if(!LITEMS.length){showM(`<h3>${L('un_leftovers_title',esc(LNAME))}</h3><p class="lbl">${L('un_leftovers_empty')}</p><div class="row"><button class="ghost" onclick="closeM();loadPrograms()">${L('close')}</button></div>`);return}
+  showM(`<h3>${L('un_leftovers_title',esc(LNAME))}</h3><ul>${LITEMS.map((it,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${LSEL.has(i)?'checked':''} onchange="ltog(${i},this.checked)"> ${esc(it.path)}</label><b>${num(it.size)}</b></li>`).join('')}</ul>
   <div class="row"><button class="pri" ${LSEL.size?'':'disabled'} onclick="doDeleteLeftovers()">${L('un_leftovers_del')}</button><button class="ghost" onclick="closeM();loadPrograms()">${L('close')}</button></div>`);
 }
 function ltog(i,on){on?LSEL.add(i):LSEL.delete(i);drawLeftovers()}
