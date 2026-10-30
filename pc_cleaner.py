@@ -39,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.0"
+VERSION = "3.2"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -704,6 +704,192 @@ def q_restore(e) -> bool:
 # ------------------------------------------------------- winget apps & prefs
 # The list is fixed inside the exe. The page only ever sends a key from this list,
 # never an ID or a command, so nothing else can be installed.
+# ------------------------------------------------------------- uninstalling
+UNINSTALL_ROOTS = [
+    ("HKLM64", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKLM32", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+]
+UWP_BLOCKLIST = (
+    "shellexperiencehost", "startmenuexperiencehost", "sechealthui", "windowsstore",
+    "desktopappinstaller", "aad.brokerplugin", "accountscontrol", "creddialoghost",
+    "cloudexperiencehost", "parentalcontrols", "pinningconfirmationdialog",
+    "secureassessmentbrowser", "peopleexperiencehost", "capturepicker",
+    "narratorquickstart", "advertising.xaml", "vclibs", "net.native", "ui.xaml",
+    "windows.cbs", "storepurchaseapp", "windows.immersivecontrolpanel",
+    "windows.assignedaccesslockapp", "lockapp", "windows.search", "ecapp",
+    "microsoft.windows.cortana", "windows.photos",
+)
+_NAME_STOP = {"microsoft", "inc", "ltd", "corporation", "corp", "llc", "software",
+              "the", "a", "an", "gmbh", "co", "solutions", "technologies", "international"}
+
+
+def _reg_programs(hive_name: str, path: str) -> List[dict]:
+    import winreg
+    hive = winreg.HKEY_CURRENT_USER if hive_name == "HKCU" else winreg.HKEY_LOCAL_MACHINE
+    extra = winreg.KEY_WOW64_32KEY if hive_name == "HKLM32" else (
+        winreg.KEY_WOW64_64KEY if hive_name == "HKLM64" else 0)
+    out = []
+    try:
+        root = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | extra)
+    except OSError:
+        return out
+    with root:
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                with winreg.OpenKey(root, sub) as k:
+                    def rd(name, default=""):
+                        try:
+                            return winreg.QueryValueEx(k, name)[0]
+                        except OSError:
+                            return default
+                    name = rd("DisplayName")
+                    if not name or rd("SystemComponent", 0) == 1 or rd("ParentKeyName"):
+                        continue  # no name, an OS component, or an update/patch entry
+                    uninst = rd("UninstallString")
+                    if not uninst:
+                        continue
+                    out.append({
+                        "reg": (hive_name, path, sub), "name": str(name),
+                        "publisher": str(rd("Publisher", "")), "version": str(rd("DisplayVersion", "")),
+                        "size_kb": int(rd("EstimatedSize", 0) or 0), "install_date": str(rd("InstallDate", "")),
+                        "uninstall": str(uninst), "quiet": str(rd("QuietUninstallString", "")),
+                    })
+            except OSError:
+                continue
+    return out
+
+
+def list_installed_programs() -> List[dict]:
+    seen, out = set(), []
+    for hive_name, path in UNINSTALL_ROOTS:
+        for p in _reg_programs(hive_name, path):
+            key = (p["name"].lower(), p["publisher"].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    out.sort(key=lambda p: p["name"].lower())
+    return out
+
+
+def uninstall_command(entry: dict):
+    """Pick the safest available way to run this program's own uninstaller."""
+    quiet = entry.get("quiet") or ""
+    if quiet:
+        return quiet, True  # the vendor's own silent switch
+    raw = entry.get("uninstall") or ""
+    m = re.search(r"\{[0-9A-Fa-f-]{36}\}", raw)
+    if m and "msiexec" in raw.lower():
+        return f'msiexec.exe /x {m.group(0)} /qn /norestart', True  # standard MSI silent uninstall
+    return raw, False  # run as registered; the program's own window may appear
+
+
+def fmt_install_date(d: str) -> str:
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    return ""
+
+
+def _name_tokens(text: str) -> List[str]:
+    words = re.findall(r"[A-Za-z0-9]+", text or "")
+    return [w for w in words if len(w) >= 3 and w.lower() not in _NAME_STOP]
+
+
+def find_leftovers(name: str, publisher: str) -> List[dict]:
+    tokens = list(dict.fromkeys(t.lower() for t in _name_tokens(name) + _name_tokens(publisher)))[:6]
+    if not tokens:
+        return []
+    roots = [env("ProgramFiles"), env("ProgramFiles(x86)"), env("ProgramData"),
+             env("LOCALAPPDATA"), env("APPDATA")]
+    found = []
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            low = entry.lower()
+            if not any(t in low for t in tokens):
+                continue
+            p = os.path.join(root, entry)
+            if is_forbidden(p) or is_reparse(p):
+                continue
+            try:
+                if os.path.isdir(p):
+                    files, _ = walk(p)
+                    size = sum(sz for _, sz in files)
+                else:
+                    size = os.path.getsize(p)
+            except OSError:
+                size = 0
+            found.append({"path": p, "size": size})
+    found.sort(key=lambda x: -x["size"])
+    return found[:25]
+
+
+def remove_dir_tree(path: str) -> bool:
+    files, dirs = walk(path)
+    ok = True
+    for fp, _ in files:
+        if not remove_file(fp):
+            ok = False
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            ok = False
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+    return ok
+
+
+def list_uwp_apps() -> List[dict]:
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-AppxPackage | Select-Object Name,PackageFullName,Publisher,NonRemovable | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=30, creationflags=0x08000000)
+        data = json.loads(r.stdout or "[]")
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for a in data:
+        full, name = a.get("PackageFullName") or "", a.get("Name") or ""
+        if not full or not name or a.get("NonRemovable"):
+            continue
+        low = full.lower()
+        if any(b in low for b in UWP_BLOCKLIST):
+            continue
+        out.append({"name": name, "full": full, "publisher": a.get("Publisher") or ""})
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def remove_uwp(full_name: str) -> bool:
+    safe = full_name.replace("'", "''")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Remove-AppxPackage -Package '{safe}'"],
+            capture_output=True, text=True, timeout=120, creationflags=0x08000000)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 APPS = [  # (key, group, name, winget id, note)
     ("chrome", "المتصفحات", "Google Chrome", "Google.Chrome", ""),
     ("firefox", "المتصفحات", "Mozilla Firefox", "Mozilla.Firefox", ""),
@@ -970,7 +1156,20 @@ class Api:
             elif s.kind == "cleanmgr" and admin:
                 cm.append(s.reg_key)
         if cm:
+            # cleanmgr/Windows.old deletion doesn't report how much it freed, so we measure the
+            # drive's free space before and after and count the real difference.
+            drive = (env("SystemDrive") or "C:") + os.sep
+            try:
+                before = shutil.disk_usage(drive).free
+            except OSError:
+                before = None
             run_cleanmgr(cm)
+            if before is not None:
+                try:
+                    after = shutil.disk_usage(drive).free
+                    freed += max(0, after - before)
+                except OSError:
+                    pass
         return {"freed": freed, "skipped": skipped, "windows_tool": bool(cm), "restore": restore}
 
     def downloads_list(self):
@@ -1048,6 +1247,76 @@ class Api:
         q_save(keep)
         return True
 
+    def get_programs(self):
+        self._progs = {}
+        out = []
+        for i, p in enumerate(list_installed_programs()):
+            pid = f"p{i}"
+            self._progs[pid] = p
+            out.append({"id": pid, "name": p["name"], "publisher": p["publisher"],
+                        "version": p["version"], "size": p["size_kb"] * 1024,
+                        "date": fmt_install_date(p["install_date"])})
+        return out
+
+    def uninstall_program(self, pid):
+        p = getattr(self, "_progs", {}).get(pid) if isinstance(pid, str) else None
+        if not p:
+            return {"ok": False, "code": "not-found"}
+        cmd, silent = uninstall_command(p)
+        if not cmd:
+            return {"ok": False, "code": "no-uninstaller"}
+        try:
+            r = subprocess.run(cmd, shell=True, stdin=subprocess.DEVNULL,
+                               capture_output=silent, timeout=1800)
+            ok = r.returncode in (0, 3010)  # 3010 = MSI success, reboot needed
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "code": "timeout"}
+        except Exception:
+            return {"ok": False, "code": "error"}
+        return {"ok": ok, "code": "" if ok else f"exit {r.returncode}", "silent": silent}
+
+    def scan_leftovers(self, pid):
+        p = getattr(self, "_progs", {}).get(pid) if isinstance(pid, str) else None
+        if not p:
+            return []
+        items = find_leftovers(p["name"], p["publisher"])
+        self._leftovers = {f"l{i}": it["path"] for i, it in enumerate(items)}
+        return [{"id": f"l{i}", "path": it["path"], "size": it["size"]} for i, it in enumerate(items)]
+
+    def delete_leftovers(self, ids):
+        ids = set(i for i in ids if isinstance(i, str))
+        store = getattr(self, "_leftovers", {})
+        freed = failed = 0
+        for lid in ids:
+            path = store.get(lid)
+            if not path or is_forbidden(path) or not os.path.exists(path) or is_reparse(path):
+                continue
+            try:
+                if os.path.isdir(path):
+                    files, _ = walk(path)
+                    sz = sum(s for _, s in files)
+                    if remove_dir_tree(path):
+                        freed += sz
+                    else:
+                        failed += 1
+                else:
+                    sz = os.path.getsize(path)
+                    if remove_file(path):
+                        freed += sz
+                    else:
+                        failed += 1
+            except OSError:
+                failed += 1
+        return {"freed": freed, "failed": failed}
+
+    def get_uwp_apps(self):
+        return list_uwp_apps()
+
+    def uninstall_uwp(self, full_name):
+        if not isinstance(full_name, str) or not full_name:
+            return {"ok": False}
+        return {"ok": remove_uwp(full_name)}
+
     def get_apps(self):
         return {"winget": find_winget() is not None,
                 "apps": [{"key": a[0], "group": a[1], "group_en": GROUP_EN.get(a[1], a[1]), "name": a[2],
@@ -1118,17 +1387,17 @@ html,body{height:100%}
 body{margin:0;padding:18px;background:var(--bg);color:var(--tx);font-family:"Segoe UI",Tahoma,sans-serif;font-size:15px;overflow:hidden}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(420px 380px at 100% 50%,var(--glow1),transparent 70%),radial-gradient(420px 380px at 0% 50%,var(--glow2),transparent 70%)}
 .app{position:relative;display:flex;height:calc(100vh - 36px);border-radius:28px;overflow:hidden;background:var(--frame);border:1px solid var(--line);box-shadow:var(--fsh)}
-aside{width:224px;flex:none;background:var(--side);display:flex;flex-direction:column;padding:14px;gap:6px;border-inline-end:1px solid var(--line);overflow:hidden;transition:width .25s ease}
+aside{width:248px;flex:none;background:var(--side);display:flex;flex-direction:column;padding:14px;gap:6px;border-inline-end:1px solid var(--line);overflow-x:hidden;overflow-y:auto;transition:width .25s ease}
 aside.col{width:78px}
-.lb{white-space:nowrap}
+.lb{white-space:normal;line-height:1.3}
 .burger{align-self:flex-end;width:38px;height:38px;padding:0;display:grid;place-items:center;background:transparent;color:var(--stx);border-radius:12px;flex:none}
 .burger:hover{background:var(--line)}
 .burger svg,.tab svg{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .burger svg{width:22px;height:22px}
 .logo{display:flex;flex-direction:column;align-items:center;gap:8px;padding:0 8px 16px;color:var(--tx);font-size:18px;font-weight:700;text-align:center}
 .logo img{display:block;width:96px;height:96px;filter:drop-shadow(0 6px 14px #0003);transition:width .25s,height .25s}
-.tab{display:flex;align-items:center;gap:10px;width:100%;text-align:start;background:transparent;color:var(--stx);padding:12px 14px;border-radius:14px;font-size:14.5px}
-.tab svg{width:20px;height:20px;flex:none}
+.tab{display:flex;align-items:center;gap:10px;width:100%;text-align:start;background:transparent;color:var(--stx);padding:12px 14px;border-radius:14px;font-size:14px}
+.tab svg{width:20px;height:20px;flex:none;align-self:flex-start;margin-top:2px}
 .tab:hover{background:var(--line);transform:translateX(calc(var(--d)*-3px))}
 .tab.on{background:var(--onbg);color:var(--ontx);font-weight:600;box-shadow:var(--sh)}
 .sfoot{margin-top:auto;display:flex;flex-direction:column;gap:10px}
@@ -1249,6 +1518,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <button class="tab on" data-t="0" onclick="tab('0')"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg><span class="lb" data-i="nav_home"></span></button>
   <button class="tab" data-t="1" onclick="tab('1')"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 12l5-5"/><path d="M17 3v4h4"/></svg><span class="lb" data-i="nav_clean"></span></button>
   <button class="tab" data-t="2" onclick="tab('2')"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span class="lb" data-i="nav_setup"></span></button>
+  <button class="tab" data-t="3" onclick="tab('3')"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg><span class="lb" data-i="nav_uninstall"></span></button>
   <div class="sfoot">
     <div class="swrow"><span data-i="dark"></span><button class="sw" id="thm" role="switch" aria-checked="false" onclick="toggleTheme()"><i></i></button></div>
     <button class="lang" id="lang" onclick="toggleLang()"></button>
@@ -1279,7 +1549,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
     <button class="tile" onclick="tab('1')"><span class="ic ic1"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 12l5-5"/><path d="M17 3v4h4"/></svg></span><b data-i="q_clean"></b><small data-i="q_clean_s"></small></button>
     <button class="tile" onclick="tab('2');sub('apps')"><span class="ic ic2"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span><b data-i="q_apps"></b><small data-i="q_apps_s"></small></button>
     <button class="tile" onclick="tab('2');sub('set')"><span class="ic ic3"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></span><b data-i="q_set"></b><small data-i="q_set_s"></small></button>
-    <button class="tile" disabled><span class="ic ic4"><svg viewBox="0 0 24 24"><path d="M12 21s-7-4.5-7-10a4 4 0 0 1 7-2.5A4 4 0 0 1 19 11c0 5.5-7 10-7 10z"/></svg></span><b data-i="q_doc"></b><small data-i="soon"></small></button>
+    <button class="tile" onclick="tab('3')"><span class="ic ic4"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg></span><b data-i="q_uninst"></b><small data-i="q_uninst_s"></small></button>
+    <button class="tile" disabled><span class="ic ic1"><svg viewBox="0 0 24 24"><path d="M12 21s-7-4.5-7-10a4 4 0 0 1 7-2.5A4 4 0 0 1 19 11c0 5.5-7 10-7 10z"/></svg></span><b data-i="q_doc"></b><small data-i="soon"></small></button>
   </div>
 </section>
 
@@ -1315,6 +1586,20 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <div class="sp" id="sp-set">
     <div class="soon"><div class="ic ic3" style="margin:0 auto"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></div><h3 data-i="set_soon_title"></h3><div class="lbl" data-i="set_soon_txt"></div></div>
   </div>
+
+<section class="pane" id="p3">
+  <div class="head"><div><h1 data-i="un_title"></h1></div></div>
+  <div class="seg"><button class="on" data-s="uprogs" onclick="usub('uprogs')" data-i="sub_uprogs"></button><button data-s="uwp" onclick="usub('uwp')" data-i="sub_uwp"></button></div>
+  <div class="sp on" id="sp-uprogs">
+    <div class="warn" data-i="un_warn_progs"></div>
+    <div class="bar2"><span class="lbl" id="ucount"></span><button class="ghost" onclick="loadPrograms()" data-i="un_refresh"></button></div>
+    <div id="uprogs"></div>
+  </div>
+  <div class="sp" id="sp-uwp">
+    <div class="warn" data-i="un_warn_uwp"></div>
+    <div class="bar2"><span class="lbl" id="uwcount"></span><button class="ghost" onclick="loadUwp()" data-i="un_refresh"></button></div>
+    <div id="uwp"></div>
+  </div>
 </section>
 </main>
 </div>
@@ -1348,7 +1633,16 @@ note_one:'اختار برنامج حماية واحد بس. تثبيت أكتر 
 note_emu:'المحاكي بيشغّل ألعابك انت، وبعضها (زي PlayStation) بيحتاج ملف BIOS من جهازك الأصلي. الأداة بتثبّت المحاكي بس.',
 set_soon_title:'الإعدادات قريباً',set_soon_txt:'هنضيف هنا أهم إعدادات ويندوز بعد الفورمة، وكل إعداد بزرار تشغيل وإيقاف.',
 upd_new:'فيه إصدار جديد: {0}',upd_btn:'حدّث الآن',upd_loading:'جاري التحميل... الأداة هتتقفل وتفتح تاني لوحدها',upd_fail:'فشل التحديث، هنكمل بالنسخة الحالية',
-ver:'الإصدار {0}',admin_yes:'صلاحية مدير ✓',admin_no:'بدون صلاحية مدير'},
+ver:'الإصدار {0}',admin_yes:'صلاحية مدير ✓',admin_no:'بدون صلاحية مدير',
+nav_uninstall:'حذف البرامج',q_uninst:'حذف برامج',q_uninst_s:'شيل برامج من جهازك',un_title:'حذف البرامج',sub_uprogs:'البرامج',sub_uwp:'برامج ويندوز',
+un_warn_progs:'الأداة بتستخدم أمر الإزالة المسجل لكل برنامج في ويندوز نفسه. ممكن تفتح نافذة الحذف الأصلية بتاعة البرنامج؛ كمّلها لو ظهرت.',
+un_warn_uwp:'دي برامج ويندوز الأساسية. استبعدنا البرامج اللي حذفها بيأثر على عمل ويندوز، لكن امشي بحذر برضه.',
+un_refresh:'تحديث القائمة',un_loading:'جاري تحميل البرامج...',un_empty:'مفيش برامج ظاهرة',un_remove:'إزالة',
+un_confirm_title:'تأكيد الإزالة',un_confirm_txt:'هيتشغّل أمر إزالة {0}. ممكن تفتح نافذة الإزالة الأصلية بتاعة البرنامج، كمّلها لو ظهرت.',
+un_confirm_btn:'إزالة',un_removing:'جاري إزالة {0}...',un_done_ok:'تم إزالة {0} ✅',un_done_fail:'فشلت إزالة {0}',
+un_leftovers_btn:'دوّر على بقايا',un_leftovers_title:'بقايا {0}',un_leftovers_empty:'مفيش بقايا ظاهرة.',un_leftovers_loading:'جاري البحث...',
+un_leftovers_del:'امسح المختار',un_leftovers_done:'اتحرر {0}',un_leftovers_failed:'{0} عنصر معرفتش أمسحه',
+uwp_loading:'جاري تحميل برامج ويندوز...',uwp_empty:'مفيش برامج ظاهرة',},
 en:{brand:'PC Cleaner',nav_home:'Home',nav_clean:'Clean & Speed Up',nav_setup:'Set Up Windows After Format',dark:'Dark mode',collapse:'Open / collapse sidebar',
 hello:'Welcome back',home_sub:'A quick look at your PC.',free_lbl:'Space you can free up',go_clean:'Go to cleaning',ring_disk:'of disk C:',
 c_cpu:'Processor',c_ram:'Memory (RAM)',c_disk:'Disk (C:)',c_os:'System',ram_val:'{0} of {1}',disk_val:'{0} free of {1}',up:'Up for {0}d {1}h',
@@ -1374,7 +1668,16 @@ note_one:'Choose only one security program. Installing more than one causes conf
 note_emu:'An emulator runs your own games, and some (like PlayStation) need a BIOS file from your original console. The tool only installs the emulator.',
 set_soon_title:'Settings are coming soon',set_soon_txt:'Key Windows settings for a fresh install will appear here, each with an on/off switch.',
 upd_new:'New version available: {0}',upd_btn:'Update now',upd_loading:'Downloading... the app will close and reopen by itself',upd_fail:'Update failed; continuing with the current version',
-ver:'Version {0}',admin_yes:'Administrator ✓',admin_no:'No administrator rights'}};
+ver:'Version {0}',admin_yes:'Administrator ✓',admin_no:'No administrator rights',
+nav_uninstall:'Uninstall programs',q_uninst:'Remove programs',q_uninst_s:'Remove programs from your PC',un_title:'Uninstall programs',sub_uprogs:'Programs',sub_uwp:'Windows apps',
+un_warn_progs:"The tool runs each program's own uninstall command, registered in Windows itself. The program's own uninstall window may appear; follow it if it does.",
+un_warn_uwp:"These are built-in Windows apps. Apps whose removal would affect how Windows works were left out, but still proceed carefully.",
+un_refresh:'Refresh list',un_loading:'Loading programs...',un_empty:'No programs to show',un_remove:'Remove',
+un_confirm_title:'Confirm removal',un_confirm_txt:"This will run {0}'s uninstall command. Its own uninstall window may appear; follow it if it does.",
+un_confirm_btn:'Remove',un_removing:'Removing {0}...',un_done_ok:'{0} removed ✅',un_done_fail:'Removing {0} failed',
+un_leftovers_btn:'Scan for leftovers',un_leftovers_title:'Leftovers of {0}',un_leftovers_empty:'No leftovers found.',un_leftovers_loading:'Searching...',
+un_leftovers_del:'Delete selected',un_leftovers_done:'{0} freed',un_leftovers_failed:'{0} items could not be deleted',
+uwp_loading:'Loading Windows apps...',uwp_empty:'No apps to show',}};
 const L=(k,...a)=>{let s=(T[LANG]&&T[LANG][k])||T.ar[k]||k;a.forEach((v,i)=>{s=s.split('{'+i+'}').join(v)});return s};
 const pick=(o,k)=>LANG==='en'?(o[k+'_en']||o[k]):o[k];
 const esc=x=>String(x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -1415,10 +1718,81 @@ function tab(n){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p'+n));
   if(n==='2'&&!appsLoaded)loadApps();
+  if(n==='3'&&!progsLoaded)loadPrograms();
 }
 function sub(x){
-  document.querySelectorAll('.seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
+  document.querySelectorAll('#p2 .seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
   $('sp-apps').classList.toggle('on',x==='apps');$('sp-set').classList.toggle('on',x==='set');
+}
+function usub(x){
+  document.querySelectorAll('#p3 .seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
+  $('sp-uprogs').classList.toggle('on',x==='uprogs');$('sp-uwp').classList.toggle('on',x==='uwp');
+  if(x==='uwp'&&!uwpLoaded)loadUwp();
+}
+
+/* ---- uninstall: regular programs ---- */
+let PROGS=[],progsLoaded=false,UWPL=[],uwpLoaded=false;
+async function loadPrograms(){
+  $('uprogs').innerHTML='<p class="lbl">'+L('un_loading')+'</p>';$('ucount').textContent='';
+  PROGS=await api().get_programs();progsLoaded=true;renderPrograms();
+}
+function renderPrograms(){
+  $('ucount').textContent=PROGS.length?L('selected',PROGS.length).replace(/[0-9٠-٩]+$/,'')+PROGS.length:'';
+  if(!PROGS.length){$('uprogs').innerHTML='<p class="lbl">'+L('un_empty')+'</p>';return}
+  $('uprogs').innerHTML=PROGS.map(p=>`<div class="card"><span class="sp0"></span><div class="inf"><b>${esc(p.name)}</b><small>${esc(p.publisher||'')}${p.version?' · '+esc(p.version):''}${p.date?' · '+esc(p.date):''}</small></div><div class="sz">${p.size?num(p.size):''}</div><button class="ghost" onclick="confirmUninstall('${p.id}')">${L('un_remove')}</button></div>`).join('');
+}
+function confirmUninstall(id){
+  const p=PROGS.find(x=>x.id===id);if(!p)return;
+  showM(`<h3>${L('un_confirm_title')}</h3><p>${L('un_confirm_txt',esc(p.name))}</p><div class="row"><button class="pri" onclick="doUninstall('${id}')">${L('un_confirm_btn')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
+}
+async function doUninstall(id){
+  const p=PROGS.find(x=>x.id===id);if(!p)return;
+  showM(`<h3>${L('un_removing',esc(p.name))}</h3>`);
+  const r=await api().uninstall_program(id);
+  let h=r.ok?`<h3>${L('un_done_ok',esc(p.name))}</h3>`:`<h3>${L('un_done_fail',esc(p.name))}</h3>`+(r.code?`<p class="lbl">${esc(r.code)}</p>`:'');
+  h+=`<div class="row"><button class="ghost" onclick="openLeftovers('${id}')">${L('un_leftovers_btn')}</button><button class="pri" onclick="closeM();loadPrograms()">${L('ok')}</button></div>`;
+  showM(h);
+}
+let LSEL=new Set(),LITEMS=[];
+async function openLeftovers(id){
+  showM('<h3>'+L('un_leftovers_loading')+'</h3>');
+  LITEMS=await api().scan_leftovers(id);LSEL=new Set();drawLeftovers();
+}
+function drawLeftovers(){
+  const p=PROGS.find(x=>PROGS.some(y=>y===x));
+  if(!LITEMS.length){showM(`<h3>${L('un_leftovers_title','')}</h3><p class="lbl">${L('un_leftovers_empty')}</p><div class="row"><button class="ghost" onclick="closeM();loadPrograms()">${L('close')}</button></div>`);return}
+  showM(`<h3>${L('un_leftovers_title','')}</h3><ul>${LITEMS.map((it,i)=>`<li><label class="chk" style="margin:0"><input type="checkbox" ${LSEL.has(i)?'checked':''} onchange="ltog(${i},this.checked)"> ${esc(it.path)}</label><b>${num(it.size)}</b></li>`).join('')}</ul>
+  <div class="row"><button class="pri" ${LSEL.size?'':'disabled'} onclick="doDeleteLeftovers()">${L('un_leftovers_del')}</button><button class="ghost" onclick="closeM();loadPrograms()">${L('close')}</button></div>`);
+}
+function ltog(i,on){on?LSEL.add(i):LSEL.delete(i);drawLeftovers()}
+async function doDeleteLeftovers(){
+  const ids=[...LSEL].map(i=>LITEMS[i].id);
+  const r=await api().delete_leftovers(ids);
+  let h='<h3>'+L('done')+'</h3>';
+  if(r.freed)h+='<p>'+L('un_leftovers_done','<b>'+num(r.freed)+'</b>')+'</p>';
+  if(r.failed)h+='<p>'+L('un_leftovers_failed',r.failed)+'</p>';
+  showM(h+`<div class="row"><button class="pri" onclick="closeM();loadPrograms()">${L('ok')}</button></div>`);
+}
+
+/* ---- uninstall: built-in Windows (UWP) apps ---- */
+async function loadUwp(){
+  $('uwp').innerHTML='<p class="lbl">'+L('uwp_loading')+'</p>';$('uwcount').textContent='';
+  UWPL=await api().get_uwp_apps();uwpLoaded=true;renderUwp();
+}
+function renderUwp(){
+  $('uwcount').textContent=UWPL.length?String(UWPL.length):'';
+  if(!UWPL.length){$('uwp').innerHTML='<p class="lbl">'+L('uwp_empty')+'</p>';return}
+  $('uwp').innerHTML=UWPL.map((a,i)=>`<div class="card"><span class="sp0"></span><div class="inf"><b>${esc(a.name)}</b><small>${esc(a.publisher||'')}</small></div><button class="ghost" onclick="confirmUwp(${i})">${L('un_remove')}</button></div>`).join('');
+}
+function confirmUwp(i){
+  const a=UWPL[i];if(!a)return;
+  showM(`<h3>${L('un_confirm_title')}</h3><p>${L('un_confirm_txt',esc(a.name))}</p><div class="row"><button class="pri" onclick="doUwp(${i})">${L('un_confirm_btn')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
+}
+async function doUwp(i){
+  const a=UWPL[i];if(!a)return;
+  showM(`<h3>${L('un_removing',esc(a.name))}</h3>`);
+  const r=await api().uninstall_uwp(a.full);
+  showM(`<h3>${r.ok?L('un_done_ok',esc(a.name)):L('un_done_fail',esc(a.name))}</h3><div class="row"><button class="pri" onclick="closeM();loadUwp()">${L('ok')}</button></div>`);
 }
 
 /* ---- home ---- */
