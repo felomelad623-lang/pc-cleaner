@@ -39,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -857,6 +857,84 @@ def remove_dir_tree(path: str) -> bool:
     return ok
 
 
+# Friendly names for Windows apps: package name (lowercase) -> (Arabic, English).
+UWP_NAMES = {
+    "microsoft.bingweather": ("الطقس", "Weather"),
+    "microsoft.bingnews": ("الأخبار", "News"),
+    "microsoft.bingsearch": ("بحث Bing", "Bing Search"),
+    "microsoft.bingfinance": ("المال", "Money"),
+    "microsoft.bingsports": ("الرياضة", "Sports"),
+    "microsoft.gethelp": ("احصل على مساعدة", "Get Help"),
+    "microsoft.getstarted": ("نصائح ويندوز", "Tips"),
+    "microsoft.microsoftofficehub": ("Microsoft 365 (Office)", "Microsoft 365 (Office)"),
+    "microsoft.office.onenote": ("OneNote", "OneNote"),
+    "microsoft.office.sway": ("Sway", "Sway"),
+    "microsoft.microsoftsolitairecollection": ("ألعاب الورق Solitaire", "Solitaire Collection"),
+    "microsoft.microsoftstickynotes": ("الملاحظات اللاصقة", "Sticky Notes"),
+    "microsoft.todos": ("Microsoft To Do (المهام)", "Microsoft To Do"),
+    "microsoft.people": ("الأشخاص", "People"),
+    "microsoft.powerautomatedesktop": ("Power Automate", "Power Automate"),
+    "microsoft.screensketch": ("أداة القص", "Snipping Tool"),
+    "microsoft.windowsalarms": ("الساعة والمنبّه", "Clock & Alarms"),
+    "microsoft.windowscalculator": ("الآلة الحاسبة", "Calculator"),
+    "microsoft.windowscamera": ("الكاميرا", "Camera"),
+    "microsoft.windowscommunicationsapps": ("البريد والتقويم", "Mail and Calendar"),
+    "microsoft.windowsfeedbackhub": ("مركز الملاحظات", "Feedback Hub"),
+    "microsoft.windowsmaps": ("الخرائط", "Maps"),
+    "microsoft.windowsnotepad": ("المفكرة", "Notepad"),
+    "microsoft.windowssoundrecorder": ("مسجّل الصوت", "Voice Recorder"),
+    "microsoft.windowsterminal": ("Windows Terminal", "Windows Terminal"),
+    "microsoft.paint": ("الرسام Paint", "Paint"),
+    "microsoft.mspaint": ("الرسام ثلاثي الأبعاد", "Paint 3D"),
+    "microsoft.microsoft3dviewer": ("عارض ثلاثي الأبعاد", "3D Viewer"),
+    "microsoft.print3d": ("طباعة ثلاثية الأبعاد", "Print 3D"),
+    "microsoft.mixedreality.portal": ("بوابة الواقع المختلط", "Mixed Reality Portal"),
+    "microsoft.skypeapp": ("Skype", "Skype"),
+    "microsoft.wallet": ("المحفظة", "Wallet"),
+    "microsoft.yourphone": ("ربط الهاتف", "Phone Link"),
+    "microsoft.zunemusic": ("مشغّل الموسيقى (Groove)", "Groove Music"),
+    "microsoft.zunevideo": ("الأفلام والتلفزيون", "Movies & TV"),
+    "microsoft.549981c3f5f10": ("كورتانا", "Cortana"),
+    "microsoft.outlookforwindows": ("Outlook", "Outlook"),
+    "microsoft.windows.devhome": ("Dev Home", "Dev Home"),
+    "microsoft.gamingapp": ("تطبيق Xbox", "Xbox"),
+    "microsoft.xboxapp": ("تطبيق Xbox", "Xbox"),
+    "microsoft.xbox.tcui": ("واجهة Xbox", "Xbox TCUI"),
+    "microsoft.xboxgameoverlay": ("شريط ألعاب Xbox", "Xbox Game Overlay"),
+    "microsoft.xboxgamingoverlay": ("شريط ألعاب Xbox", "Xbox Game Bar"),
+    "microsoft.xboxidentityprovider": ("حساب Xbox", "Xbox Identity Provider"),
+    "microsoft.xboxspeechtotextoverlay": ("الكلام إلى نص في Xbox", "Xbox Speech To Text"),
+    "microsoftcorporationii.quickassist": ("المساعدة السريعة", "Quick Assist"),
+    "microsoftcorporationii.microsoftfamily": ("عائلة مايكروسوفت", "Microsoft Family"),
+    "clipchamp.clipchamp": ("Clipchamp (مونتاج فيديو)", "Clipchamp (video editor)"),
+    "microsoftteams": ("Microsoft Teams", "Microsoft Teams"),
+    "msteams": ("Microsoft Teams", "Microsoft Teams"),
+    "microsoft.microsoftedge.stable": ("Microsoft Edge", "Microsoft Edge"),
+    "5319275a.whatsappdesktop": ("WhatsApp", "WhatsApp"),
+    "spotifyab.spotifymusic": ("Spotify", "Spotify"),
+    "4df9e0f8.netflix": ("Netflix", "Netflix"),
+    "disney.37853fc22b2ce": ("Disney+", "Disney+"),
+    "bytedancepte.ltd.tiktok": ("TikTok", "TikTok"),
+    "facebook.facebook": ("Facebook", "Facebook"),
+    "facebook.instagram": ("Instagram", "Instagram"),
+    "amazon.com.amazon": ("Amazon", "Amazon"),
+    "microsoft.onedrive": ("OneDrive", "OneDrive"),
+    "microsoft.windows.photos": ("الصور", "Photos"),
+}
+
+
+def uwp_friendly(name: str):
+    """(Arabic, English) display names. Known apps come from the table; others get a cleaned-up name."""
+    known = UWP_NAMES.get(name.lower())
+    if known:
+        return known
+    seg = name.split(".")[-1] if "." in name else name
+    if re.fullmatch(r"[0-9A-Fa-f]{8,}", seg):
+        seg = name  # a code-like name: keep the whole thing rather than show noise
+    pretty = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", seg).replace("_", " ").strip() or name
+    return pretty, pretty
+
+
 def list_uwp_apps() -> List[dict]:
     try:
         r = subprocess.run(
@@ -876,8 +954,11 @@ def list_uwp_apps() -> List[dict]:
         low = full.lower()
         if any(b in low for b in UWP_BLOCKLIST):
             continue
-        out.append({"name": name, "full": full, "publisher": a.get("Publisher") or ""})
-    out.sort(key=lambda x: x["name"].lower())
+        ar, en = uwp_friendly(name)
+        cn = re.search(r"CN=([^,]+)", a.get("Publisher") or "")
+        out.append({"name": name, "full": full, "title": ar, "title_en": en,
+                    "publisher": cn.group(1).strip('" ') if cn else ""})
+    out.sort(key=lambda x: x["title_en"].lower())
     return out
 
 
@@ -1786,17 +1867,17 @@ async function loadUwp(){
 function renderUwp(){
   $('uwcount').textContent=UWPL.length?String(UWPL.length):'';
   if(!UWPL.length){$('uwp').innerHTML='<p class="lbl">'+L('uwp_empty')+'</p>';return}
-  $('uwp').innerHTML=UWPL.map((a,i)=>`<div class="card"><span class="sp0"></span><div class="inf"><b>${esc(a.name)}</b><small>${esc(a.publisher||'')}</small></div><button class="ghost" onclick="confirmUwp(${i})">${L('un_remove')}</button></div>`).join('');
+  $('uwp').innerHTML=UWPL.map((a,i)=>`<div class="card"><span class="sp0"></span><div class="inf"><b>${esc(pick(a,'title'))}</b><small>${esc(a.publisher||'')}</small></div><button class="ghost" onclick="confirmUwp(${i})">${L('un_remove')}</button></div>`).join('');
 }
 function confirmUwp(i){
   const a=UWPL[i];if(!a)return;
-  showM(`<h3>${L('un_confirm_title')}</h3><p>${L('un_confirm_txt',esc(a.name))}</p><div class="row"><button class="pri" onclick="doUwp(${i})">${L('un_confirm_btn')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
+  showM(`<h3>${L('un_confirm_title')}</h3><p>${L('un_confirm_txt',esc(pick(a,'title')))}</p><div class="row"><button class="pri" onclick="doUwp(${i})">${L('un_confirm_btn')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
 }
 async function doUwp(i){
   const a=UWPL[i];if(!a)return;
-  showM(`<h3>${L('un_removing',esc(a.name))}</h3>`);
+  showM(`<h3>${L('un_removing',esc(pick(a,'title')))}</h3>`);
   const r=await api().uninstall_uwp(a.full);
-  showM(`<h3>${r.ok?L('un_done_ok',esc(a.name)):L('un_done_fail',esc(a.name))}</h3><div class="row"><button class="pri" onclick="closeM();loadUwp()">${L('ok')}</button></div>`);
+  showM(`<h3>${r.ok?L('un_done_ok',esc(pick(a,'title'))):L('un_done_fail',esc(pick(a,'title')))}</h3><div class="row"><button class="pri" onclick="closeM();loadUwp()">${L('ok')}</button></div>`);
 }
 
 /* ---- home ---- */
