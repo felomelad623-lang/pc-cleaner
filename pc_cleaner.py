@@ -39,7 +39,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.2.2"
+VERSION = "3.3"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -1065,6 +1065,348 @@ NOTE_EN = {
 }
 
 
+# ------------------------------------------------------- Windows settings (tweaks)
+# The list is fixed inside the exe. The page only ever sends a key from this list plus on/off,
+# never a registry path or a command, so nothing else can be changed from outside.
+CDM = r"SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+EXPL_ADV = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+CLSID_CLASSIC = r"SOFTWARE\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+SR_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+BALANCED = "381b4222-f694-41f0-9685-ff5bb260df2e"
+HIGHPERF = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+ULTIMATE = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+DNS_PRIMARY, DNS_SECOND = "1.1.1.1", "1.0.0.1"
+GUID_RE = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+
+TWEAK_GROUPS = [
+    ("sec", "الأمان والاستعادة", "Safety and recovery"),
+    ("priv", "الخصوصية والإعلانات", "Privacy and ads"),
+    ("use", "الاستخدام اليومي", "Everyday use"),
+    ("perf", "الأداء", "Performance"),
+    ("net", "الشبكة", "Network"),
+]
+
+
+def _tw(k, g, t, what, why, note=None, rec=False, adm=False, w11=False, need="", kind="reg", items=(), no_off=False):
+    # items: (hive, path, name, type, value_when_on, value_when_off); value_when_off None = delete the value
+    return {"k": k, "g": g, "t": t, "what": what, "why": why, "note": note or ("", ""), "rec": rec, "adm": adm,
+            "w11": w11, "need": need, "kind": kind, "items": items, "no_off": no_off}
+
+
+_CDM_NAMES = ("SilentInstalledAppsEnabled", "SystemPaneSuggestionsEnabled", "SoftLandingEnabled",
+              "SubscribedContent-338388Enabled", "SubscribedContent-338389Enabled",
+              "SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled",
+              "SubscribedContent-353696Enabled")
+
+TWEAKS = [
+    _tw("restore", "sec", ("تفعيل نقاط الاستعادة (حماية النظام)", "Turn on restore points (System Protection)"),
+        ("بيشغّل حماية النظام على الدرايف C:. وقتها ويندوز يقدر يحفظ نسخة من حالته قبل أي تغيير كبير.",
+         "Turns on System Protection for drive C:, so Windows can save a snapshot of its state before big changes."),
+        ("لو حاجة باظت بعد تثبيت برنامج أو تعديل، ترجّع الجهاز لنقطة سليمة. وبعد الفورمة بتبقى مقفولة غالباً.",
+         "If something breaks after an install or a change, you can roll back. It is often off after a fresh format."),
+        ("بياخد جزء صغير من مساحة القرص. ويندوز بيسمح بنقطة استعادة واحدة كل 24 ساعة افتراضياً.",
+         "It uses a small part of the disk. By default Windows allows one restore point every 24 hours."),
+        rec=True, adm=True, kind="special", no_off=True),
+    _tw("ads", "priv", ("إيقاف إعلانات واقتراحات ويندوز", "Turn off Windows ads and suggestions"),
+        ("بيمنع ويندوز يعرض إعلانات واقتراحات تطبيقات في قايمة ابدأ والإعدادات وشاشة القفل، ويمنع تثبيت تطبيقات دعائية لوحدها.",
+         "Stops Windows from showing ads and app suggestions in Start, Settings and the lock screen, and from silently installing promoted apps."),
+        ("قايمة ابدأ بتبقى أنضف وأسرع، ومفيش تطبيقات مش عايزها بتنزل لوحدها.",
+         "A cleaner Start menu, and no unwanted apps appearing by themselves."),
+        ("ممكن ويندوز يرجّع بعض الاقتراحات بعد التحديثات الكبيرة، والأداة بتوريك الحالة الحقيقية كل مرة.",
+         "Big Windows updates may bring some suggestions back; the tool always shows the real state."),
+        rec=True, items=tuple(("HKCU", CDM, n, "dword", 0, 1) for n in _CDM_NAMES)),
+    _tw("adid", "priv", ("إيقاف معرّف الإعلانات", "Turn off the advertising ID"),
+        ("معرّف بيدّيه ويندوز للتطبيقات عشان تعرض لك إعلانات على حسب اهتماماتك.",
+         "An ID Windows gives to apps so they can show ads based on your interests."),
+        ("إعلانات أقل بتتبعك، وخصوصية أحسن.", "Less ad tracking and better privacy."),
+        rec=True, items=(("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo", "Enabled", "dword", 0, 1),)),
+    _tw("bing", "priv", ("إيقاف بحث الإنترنت في قايمة ابدأ", "Turn off web search in Start"),
+        ("لما تكتب في بحث ابدأ، ويندوز بيدوّر في جهازك بس وميعرضش نتايج Bing من الإنترنت.",
+         "When you search from Start, Windows looks only on your PC and does not show Bing web results."),
+        ("البحث بيبقى أسرع وأنضف، وكلامك اللي بتكتبه مبيتبعتش لمايكروسوفت.",
+         "Search is faster and cleaner, and what you type is not sent to Microsoft."),
+        ("على بعض إصدارات ويندوز 11 ممكن الأثر ميبانش كامل.",
+         "On some Windows 11 builds the effect may not be complete."),
+        rec=True, items=(
+            ("HKCU", r"SOFTWARE\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", "dword", 1, None),
+            ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Search", "BingSearchEnabled", "dword", 0, 1))),
+    _tw("telemetry", "priv", ("تقليل بيانات التشخيص", "Reduce diagnostic data"),
+        ("بيطلب من ويندوز يبعت أقل قدر من بيانات الاستخدام لمايكروسوفت.",
+         "Asks Windows to send the minimum usage data to Microsoft."),
+        ("خصوصية أحسن شوية.", "Slightly better privacy."),
+        ("في ويندوز Home وPro ويندوز بيفضل يبعت الحد الأدنى المطلوب ومبيقفلهاش تماماً. الإيقاف الكامل بس في Enterprise وEducation.",
+         "On Windows Home and Pro, Windows still sends the required minimum. A full off exists only in Enterprise and Education."),
+        adm=True, items=(("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", "dword", 0, None),)),
+    _tw("fileext", "use", ("إظهار امتدادات الملفات", "Show file extensions"),
+        ("بيظهر آخر اسم الملف زي .pdf و.exe و.jpg.", "Shows the ending of file names, like .pdf, .exe and .jpg."),
+        ("بتعرف نوع الملف الحقيقي، ومبتتخدعش بملف اسمه صورة.jpg.exe.",
+         "You see the real file type and are not fooled by a file named photo.jpg.exe."),
+        rec=True, need="explorer", items=(("HKCU", EXPL_ADV, "HideFileExt", "dword", 0, 1),)),
+    _tw("hidden", "use", ("إظهار الملفات المخفية", "Show hidden files"),
+        ("بيظهر الملفات والمجلدات المخفية في المستكشف.", "Shows hidden files and folders in File Explorer."),
+        ("مفيد لو بتدوّر على ملفات برامج أو بتصلّح مشكلة.", "Useful when you look for program files or fix a problem."),
+        ("متمسحش حاجة منها وإنت مش متأكد، لأن بعضها ملفات نظام.",
+         "Do not delete things you are not sure about; some are system files."),
+        need="explorer", items=(("HKCU", EXPL_ADV, "Hidden", "dword", 1, 2),)),
+    _tw("launchto", "use", ("فتح المستكشف على «هذا الكمبيوتر»", "Open File Explorer on This PC"),
+        ("لما تفتح مستكشف الملفات بيبدأ بالدرايفات بدل الصفحة الرئيسية والملفات الأخيرة.",
+         "File Explorer opens on your drives instead of Home and recent files."),
+        ("توصل للدرايفات والمجلدات بسرعة.", "Reach your drives and folders faster."),
+        rec=True, need="explorer", items=(("HKCU", EXPL_ADV, "LaunchTo", "dword", 1, None),)),
+    _tw("thispc", "use", ("أيقونة «هذا الكمبيوتر» على سطح المكتب", "This PC icon on the desktop"),
+        ("بيحط أيقونة هذا الكمبيوتر على سطح المكتب.", "Puts the This PC icon on your desktop."),
+        ("وصول سريع للدرايفات وخصائص الجهاز.", "Quick access to your drives and PC properties."),
+        rec=True, need="explorer",
+        items=(("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel",
+                "{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "dword", 0, 1),)),
+    _tw("classic", "use", ("قايمة الزر اليمين الكاملة", "Full right-click menu"),
+        ("بيرجّع قايمة الزر اليمين القديمة الكاملة في ويندوز 11 بدل ما تدوس «إظهار المزيد من الخيارات».",
+         "Brings back the full classic right-click menu in Windows 11, instead of clicking Show more options."),
+        ("كل الأوامر قدامك من أول ضغطة.", "All commands are in front of you right away."),
+        ("بعض عناصر القايمة الجديدة بتاعة ويندوز 11 هتختفي.", "Some of the new Windows 11 menu items will disappear."),
+        rec=True, w11=True, need="explorer", kind="special"),
+    _tw("sticky", "use", ("إيقاف اختصار Sticky Keys", "Turn off the Sticky Keys shortcut"),
+        ("بيمنع النافذة اللي بتظهر لما تدوس Shift خمس مرات ورا بعض.",
+         "Stops the pop-up that appears when you press Shift five times."),
+        ("مفيش نافذة بتقاطعك في الألعاب والكتابة.", "No pop-up interrupting games or typing."),
+        rec=True, need="relogin",
+        items=(("HKCU", r"Control Panel\Accessibility\StickyKeys", "Flags", "sz", "506", "510"),)),
+    _tw("taskleft", "use", ("شريط المهام ناحية اليسار", "Left-aligned taskbar"),
+        ("بينقل أيقونات شريط المهام وزرار ابدأ لناحية اليسار زي ويندوز 10.",
+         "Moves the taskbar icons and the Start button to the left, like Windows 10."),
+        ("مناسب لو متعوّد على الشكل القديم.", "Handy if you are used to the older look."),
+        w11=True, need="explorer", items=(("HKCU", EXPL_ADV, "TaskbarAl", "dword", 0, 1),)),
+    _tw("faststart", "perf", ("إيقاف التشغيل السريع (Fast Startup)", "Turn off Fast Startup"),
+        ("التشغيل السريع بيخلّي الجهاز ينام نوم عميق بدل ما يقفل تماماً. الإعداد ده بيقفله، فالجهاز بيقفل ويشتغل بالكامل.",
+         "Fast Startup puts the PC into deep hibernation instead of a full shutdown. This turns it off, so Windows shuts down fully."),
+        ("بيحل مشاكل كتير: تحديثات ما بتكملش، ودرايفات أو فلاشات مش بتتعرف، وبرامج عالقة، وتثبيت ويندوز تاني جنب ده.",
+         "Fixes many issues: updates not finishing, drives not detected, stuck programs, and dual boot."),
+        ("ممكن الجهاز ياخد ثواني زيادة في التشغيل على هارد عادي. السبات (Hibernate) نفسه بيفضل متاح.",
+         "Boot may take a few seconds longer on a hard disk. Hibernate itself stays available."),
+        rec=True, adm=True,
+        items=(("HKLM", r"SYSTEM\CurrentControlSet\Control\Session Manager\Power", "HiberbootEnabled", "dword", 0, 1),)),
+    _tw("dopt", "perf", ("إيقاف مشاركة التحديثات مع أجهزة تانية", "Stop sharing updates with other PCs"),
+        ("ويندوز ممكن يستخدم نت جهازك ويبعت أجزاء من التحديثات لأجهزة تانية. الإعداد ده بيخلّي التحميل من مايكروسوفت بس.",
+         "Windows can use your internet to send update pieces to other PCs. This makes downloads come only from Microsoft."),
+        ("بتوفر نت وسرعة الاتصال.", "Saves bandwidth and keeps your connection fast."),
+        ("بيأثر كمان على تحميل برامج متجر مايكروسوفت، وبتتحمل من مايكروسوفت مباشرة. مش بيوقف Windows Update.",
+         "It also applies to Microsoft Store downloads, which come straight from Microsoft. It does not turn off Windows Update."),
+        rec=True, adm=True,
+        items=(("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization", "DODownloadMode", "dword", 0, None),)),
+    _tw("power", "perf", ("خطة طاقة الأداء العالي", "High performance power plan"),
+        ("بيشغّل خطة الطاقة اللي بتخلّي المعالج يشتغل بأعلى أداء.",
+         "Switches to the power plan that keeps the processor at high performance."),
+        ("أداء أحسن في الألعاب والبرامج التقيلة على الكمبيوتر المكتبي.",
+         "Better performance in games and heavy programs on a desktop."),
+        ("على اللاب توب بتستهلك البطارية أسرع. وممكن تكون مش متاحة على بعض الأجهزة، وساعتها هتظهر رسالة.",
+         "On laptops it drains the battery faster. It may not be available on some PCs; you will see a message."),
+        kind="special"),
+    _tw("gamedvr", "perf", ("إيقاف تسجيل ألعاب Xbox Game Bar", "Turn off Xbox Game Bar recording"),
+        ("بيقفل تسجيل الفيديو والصور التلقائي في Xbox Game Bar.",
+         "Turns off the automatic video and screenshot capture of Xbox Game Bar."),
+        ("بيشيل حمل خفيف من الخلفية وممكن يقلل التقطيع في بعض الألعاب.",
+         "Removes a small background load and can reduce stutter in some games."),
+        ("اختصارات Win+G للتسجيل مش هتشتغل.", "The Win+G recording shortcuts will stop working."),
+        need="relogin", items=(
+            ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled", "dword", 0, 1),
+            ("HKCU", r"System\GameConfigStore", "GameDVR_Enabled", "dword", 0, 1))),
+    _tw("transp", "perf", ("إيقاف الشفافية", "Turn off transparency effects"),
+        ("بيقفل تأثير الشفافية في قايمة ابدأ وشريط المهام والنوافذ.",
+         "Turns off the see-through effect in Start, the taskbar and windows."),
+        ("بيخفف حمل بسيط على كارت الشاشة في الأجهزة الضعيفة.",
+         "Takes a little load off the graphics card on weak PCs."),
+        items=(("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", "dword", 0, 1),)),
+    _tw("mouse", "perf", ("إيقاف تسريع الماوس", "Turn off mouse acceleration"),
+        ("بيقفل «تحسين دقة المؤشر» عشان المؤشر يتحرك على قد حركة إيدك بالظبط.",
+         "Turns off Enhance pointer precision, so the pointer moves in proportion to your hand."),
+        ("حركة أدق في الألعاب والتصميم.", "More accurate movement in games and design work."),
+        kind="special"),
+    _tw("dns", "net", ("DNS أسرع (Cloudflare)", "Faster DNS (Cloudflare)"),
+        ("بيغيّر سيرفر DNS لـ Cloudflare (1.1.1.1) على كروت الشبكة الشغالة.",
+         "Changes the DNS server to Cloudflare (1.1.1.1) on the active network adapters."),
+        ("ممكن يفتح المواقع أسرع ويبقى أثبت من DNS مزوّد النت.",
+         "Can open sites faster and more reliably than your internet provider DNS."),
+        ("لو الراوتر أو الرقابة الأبوية بتفلتر المواقع عن طريق DNS، الفلترة دي هتتعطل. وإلغاء التفعيل بيرجّع DNS تلقائي.",
+         "If your router or parental controls filter sites through DNS, that filtering will stop working. Turning it off returns DNS to automatic."),
+        kind="special"),
+]
+TWEAK_BY_KEY = {t["k"]: t for t in TWEAKS}
+
+
+def win_build() -> int:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            return int(str(winreg.QueryValueEx(k, "CurrentBuildNumber")[0]))
+    except Exception:
+        return 0
+
+
+def _hv(name: str):
+    import winreg
+    return winreg.HKEY_CURRENT_USER if name == "HKCU" else winreg.HKEY_LOCAL_MACHINE
+
+
+def reg_read(hive: str, path: str, name: str):
+    import winreg
+    try:
+        with winreg.OpenKey(_hv(hive), path, 0, winreg.KEY_READ) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except OSError:
+        return None
+
+
+def reg_write(hive: str, path: str, name: str, typ: str, value):
+    import winreg
+    with winreg.CreateKeyEx(_hv(hive), path, 0, winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, name, 0, winreg.REG_SZ if typ == "sz" else winreg.REG_DWORD, value)
+
+
+def reg_delete_value(hive: str, path: str, name: str):
+    import winreg
+    try:
+        with winreg.OpenKey(_hv(hive), path, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, name)
+    except OSError:
+        pass
+
+
+def _run(args, timeout=20):
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=0x08000000)
+    return r.returncode, (r.stdout or "").strip()
+
+
+def _ps(cmd: str, timeout=30):
+    return _run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd], timeout)
+
+
+def _power_guid():
+    try:
+        _, out = _run(["powercfg", "/getactivescheme"], 10)
+        m = re.search(GUID_RE, out)
+        return m.group(0).lower() if m else None
+    except Exception:
+        return None
+
+
+def _power_set(on: bool) -> bool:
+    if not on:
+        return _run(["powercfg", "/setactive", BALANCED], 10)[0] == 0
+    if _run(["powercfg", "/setactive", HIGHPERF], 10)[0] == 0:
+        return True
+    code, out = _run(["powercfg", "/duplicatescheme", HIGHPERF], 10)  # the plan is hidden on some PCs
+    m = re.search(GUID_RE, out) if code == 0 else None
+    return bool(m) and _run(["powercfg", "/setactive", m.group(0)], 10)[0] == 0
+
+
+def _dns_state():
+    code, out = _ps("(Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | "
+                    "Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { ($_.ServerAddresses -join ',') }) -join ';'")
+    if code != 0 or not out:
+        return None
+    return all(r.startswith(DNS_PRIMARY) for r in out.split(";"))
+
+
+def _dns_set(on: bool) -> bool:
+    head = "Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex "
+    tail = ("-ServerAddresses ('" + DNS_PRIMARY + "','" + DNS_SECOND + "')") if on else "-ResetServerAddresses"
+    return _ps(head + tail + " -ErrorAction Stop }")[0] == 0
+
+
+def _restore_enable() -> bool:
+    drv = env("SystemDrive") or "C:"
+    if not re.fullmatch(r"[A-Za-z]:", drv):
+        drv = "C:"
+    return _ps(f'Enable-ComputerRestore -Drive "{drv}\\"', 60)[0] == 0
+
+
+def _mouse_set(off: bool) -> bool:
+    vals = (ctypes.c_int * 3)(0, 0, 0) if off else (ctypes.c_int * 3)(6, 10, 1)
+    return bool(ctypes.windll.user32.SystemParametersInfoW(0x0004, 0, vals, 3))  # SPI_SETMOUSE, saved + broadcast
+
+
+def _classic_set(on: bool) -> bool:
+    import winreg
+    if on:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, CLSID_CLASSIC + r"\InprocServer32", 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "")
+    else:
+        for sub in (CLSID_CLASSIC + r"\InprocServer32", CLSID_CLASSIC):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            except OSError:
+                pass
+    return True
+
+
+def tweak_state(t: dict):
+    """True = the setting is active, False = not active, None = could not tell."""
+    try:
+        if t["kind"] == "reg":
+            for hive, path, name, typ, on, off in t["items"]:
+                v = reg_read(hive, path, name)
+                if v is None or str(v) != str(on):
+                    return False
+            return True
+        k = t["k"]
+        if k == "classic":
+            import winreg
+            try:
+                winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CURRENT_USER, CLSID_CLASSIC + r"\InprocServer32"))
+                return True
+            except OSError:
+                return False
+        if k == "power":
+            g = _power_guid()
+            return None if g is None else g in (HIGHPERF, ULTIMATE)
+        if k == "mouse":
+            vals = [reg_read("HKCU", r"Control Panel\Mouse", n) for n in ("MouseSpeed", "MouseThreshold1", "MouseThreshold2")]
+            return all(v is not None and str(v) == "0" for v in vals)
+        if k == "restore":
+            return str(reg_read("HKLM", SR_KEY, "RPSessionInterval")) == "1"
+        if k == "dns":
+            return _dns_state()
+    except Exception:
+        return None
+    return None
+
+
+def tweak_apply(t: dict, on: bool) -> bool:
+    if t["kind"] == "reg":
+        for hive, path, name, typ, v_on, v_off in t["items"]:
+            if on:
+                reg_write(hive, path, name, typ, v_on)
+            elif v_off is None:
+                reg_delete_value(hive, path, name)
+            else:
+                reg_write(hive, path, name, typ, v_off)
+        return True
+    k = t["k"]
+    if k == "classic":
+        return _classic_set(on)
+    if k == "power":
+        return _power_set(on)
+    if k == "mouse":
+        return _mouse_set(on)
+    if k == "restore":
+        return _restore_enable() if on else False
+    if k == "dns":
+        return _dns_set(on)
+    return False
+
+
+def restart_explorer() -> bool:
+    """Windows brings the shell back by itself; we only start it by hand if it did not come back."""
+    try:
+        _run(["taskkill", "/f", "/im", "explorer.exe"], 15)
+        time.sleep(2)
+        if "explorer.exe" not in _run(["tasklist", "/fi", "imagename eq explorer.exe"], 10)[1].lower():
+            subprocess.Popen(["explorer.exe"])
+        return True
+    except Exception:
+        return False
+
+
 def default_lang() -> str:
     try:
         return "ar" if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x01 else "en"
@@ -1437,6 +1779,67 @@ class Api:
     def get_home(self):
         return sys_info()
 
+    def get_tweaks(self):
+        admin, build, out = is_admin(), win_build(), []
+        for t in TWEAKS:
+            if t["w11"] and build < 22000:
+                continue  # Windows 11 only
+            out.append({"key": t["k"], "group": t["g"], "title": t["t"][0], "title_en": t["t"][1],
+                        "what": t["what"][0], "what_en": t["what"][1], "why": t["why"][0], "why_en": t["why"][1],
+                        "note": t["note"][0], "note_en": t["note"][1], "rec": t["rec"], "need": t["need"],
+                        "no_off": t["no_off"], "locked": t["adm"] and not admin, "state": tweak_state(t)})
+        return {"groups": [{"id": g[0], "title": g[1], "title_en": g[2]} for g in TWEAK_GROUPS], "items": out}
+
+    def set_tweak(self, key, on):
+        t = TWEAK_BY_KEY.get(key) if isinstance(key, str) else None
+        if not t or not isinstance(on, bool):
+            return {"ok": False, "code": "bad-key"}
+        if t["adm"] and not is_admin():
+            return {"ok": False, "code": "admin"}
+        if t["w11"] and win_build() < 22000:
+            return {"ok": False, "code": "windows-11-only"}
+        if not on and t["no_off"]:
+            return {"ok": False, "code": "no-off"}
+        try:
+            ran = tweak_apply(t, on)
+        except Exception:
+            ran = False
+        st = tweak_state(t)
+        ok = bool(ran) and st is on  # trust only what Windows now reports
+        return {"ok": ok, "state": st, "need": t["need"] if ok else "", "code": "" if ok else "not-applied"}
+
+    def apply_recommended(self, restore_point=False):
+        admin, build = is_admin(), win_build()
+        rp = "off"
+        if restore_point:
+            sr = TWEAK_BY_KEY["restore"]
+            if admin and tweak_state(sr) is not True:
+                try:
+                    tweak_apply(sr, True)  # restore points only work once System Protection is on
+                except Exception:
+                    pass
+            rp = "ok" if create_restore_point() else "failed"
+        done, failed, needs = [], [], set()
+        for t in TWEAKS:
+            if not t["rec"] or (t["w11"] and build < 22000) or (t["adm"] and not admin):
+                continue
+            if tweak_state(t) is True:
+                continue
+            try:
+                ran = tweak_apply(t, True)
+            except Exception:
+                ran = False
+            if ran and tweak_state(t) is True:
+                done.append(t["k"])
+                if t["need"]:
+                    needs.add(t["need"])
+            else:
+                failed.append(t["k"])
+        return {"done": done, "failed": failed, "needs": sorted(needs), "restore": rp}
+
+    def restart_explorer(self):
+        return restart_explorer()
+
     def set_theme(self, t):
         if t in ("light", "dark"):
             p = prefs_load()
@@ -1583,7 +1986,15 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 .warn{background:#f43f5e1f;color:var(--bad);border-radius:12px;padding:10px 12px;margin-bottom:10px;font-size:14px}
 .chk{display:flex;gap:8px;align-items:center;margin-bottom:12px}
 .row{display:flex;gap:8px;justify-content:flex-start}
-.bar2{display:flex;gap:8px;align-items:center;position:sticky;top:-24px;z-index:2;background:var(--frame);padding:12px 0 10px}
+.topbar{display:flex;justify-content:flex-end;align-items:center;gap:10px;position:sticky;top:0;z-index:4;background:var(--frame);padding:6px 0 10px;margin-top:-6px}
+.topbar svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px;margin-inline-end:6px}
+.spin svg{animation:rot .9s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
+.tw{display:block}.twrow{display:flex;align-items:center;gap:12px}.twmore{margin-top:6px}
+.lnk{background:transparent;color:var(--vi);padding:4px 0;font-size:13px;border-radius:6px}.lnk:hover{text-decoration:underline}
+.twd{margin-top:8px;padding:10px 12px;background:var(--frame);border-radius:12px;font-size:14px;line-height:1.7}.twd p{margin:0 0 6px}
+.pend{display:none;background:#d9770622;color:var(--warn);border-radius:12px;padding:10px 12px;margin-bottom:10px;font-size:14px}.pend div{margin:3px 0}
+.bar2{display:flex;gap:8px;align-items:center;position:sticky;top:44px;z-index:2;background:var(--frame);padding:12px 0 10px}
 .bar2 .lbl{flex:1}
 .gh{display:flex;align-items:center;gap:8px;margin:18px 0 8px;font-size:15px;font-weight:600}
 .gh::before{content:"";width:8px;height:8px;border-radius:50%;background:linear-gradient(135deg,var(--cy),var(--pk))}
@@ -1602,7 +2013,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <button class="tab on" data-t="0" onclick="tab('0')"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg><span class="lb" data-i="nav_home"></span></button>
   <button class="tab" data-t="1" onclick="tab('1')"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 12l5-5"/><path d="M17 3v4h4"/></svg><span class="lb" data-i="nav_clean"></span></button>
   <button class="tab" data-t="2" onclick="tab('2')"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span class="lb" data-i="nav_setup"></span></button>
-  <button class="tab" data-t="3" onclick="tab('3')"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg><span class="lb" data-i="nav_uninstall"></span></button>
+  <button class="tab" data-t="3" onclick="tab('3')"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span class="lb" data-i="nav_settings"></span></button>
+  <button class="tab" data-t="4" onclick="tab('4')"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg><span class="lb" data-i="nav_uninstall"></span></button>
   <div class="sfoot">
     <div class="swrow"><span data-i="dark"></span><button class="sw" id="thm" role="switch" aria-checked="false" onclick="toggleTheme()"><i></i></button></div>
     <button class="lang" id="lang" onclick="toggleLang()"></button>
@@ -1611,6 +2023,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 </aside>
 <main>
 <div id="upd"><span id="updt"></span><button onclick="doUpdate()" data-i="upd_btn"></button></div>
+<div class="topbar"><span class="lbl" id="refl"></span><button class="ghost" id="refb" onclick="refreshAll()"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg><span data-i="refresh"></span></button></div>
 
 <section class="pane on" id="p0">
   <div class="head"><div><h1 id="hello"></h1><div class="lbl" id="hsub"></div></div></div>
@@ -1631,9 +2044,9 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <h3 class="gh" data-i="quick"></h3>
   <div class="qg">
     <button class="tile" onclick="tab('1')"><span class="ic ic1"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 12l5-5"/><path d="M17 3v4h4"/></svg></span><b data-i="q_clean"></b><small data-i="q_clean_s"></small></button>
-    <button class="tile" onclick="tab('2');sub('apps')"><span class="ic ic2"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span><b data-i="q_apps"></b><small data-i="q_apps_s"></small></button>
-    <button class="tile" onclick="tab('2');sub('set')"><span class="ic ic3"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></span><b data-i="q_set"></b><small data-i="q_set_s"></small></button>
-    <button class="tile" onclick="tab('3')"><span class="ic ic4"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg></span><b data-i="q_uninst"></b><small data-i="q_uninst_s"></small></button>
+    <button class="tile" onclick="tab('2')"><span class="ic ic2"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></span><b data-i="q_apps"></b><small data-i="q_apps_s"></small></button>
+    <button class="tile" onclick="tab('3')"><span class="ic ic3"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></span><b data-i="q_set"></b><small data-i="q_set_s"></small></button>
+    <button class="tile" onclick="tab('4')"><span class="ic ic4"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/><path d="M10 11v6M14 11v6"/></svg></span><b data-i="q_uninst"></b><small data-i="q_uninst_s"></small></button>
     <button class="tile" disabled><span class="ic ic1"><svg viewBox="0 0 24 24"><path d="M12 21s-7-4.5-7-10a4 4 0 0 1 7-2.5A4 4 0 0 1 19 11c0 5.5-7 10-7 10z"/></svg></span><b data-i="q_doc"></b><small data-i="soon"></small></button>
   </div>
 </section>
@@ -1654,7 +2067,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 
 <section class="pane" id="p2">
   <div class="head"><div><h1 data-i="setup_title"></h1></div></div>
-  <div class="seg"><button class="on" data-s="apps" onclick="sub('apps')" data-i="sub_apps"></button><button data-s="set" onclick="sub('set')" data-i="sub_set"></button></div>
   <div class="sp on" id="sp-apps">
     <div class="lbl" data-i="apps_sub"></div>
     <div class="warn" id="wg" style="display:none"></div>
@@ -1667,12 +2079,15 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
     <div id="prog" style="display:none"><div class="track"><div class="fill" id="fill"></div></div><div class="lbl" id="ptxt"></div></div>
     <div id="apps"></div>
   </div>
-  <div class="sp" id="sp-set">
-    <div class="soon"><div class="ic ic3" style="margin:0 auto"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></div><h3 data-i="set_soon_title"></h3><div class="lbl" data-i="set_soon_txt"></div></div>
-  </div>
 </section>
 
 <section class="pane" id="p3">
+  <div class="head"><div><h1 data-i="tw_title"></h1><div class="lbl" data-i="tw_sub"></div></div><button class="pri" id="twrec" onclick="confirmRec()" disabled></button></div>
+  <div class="pend" id="twnote"></div>
+  <div id="tweaks"></div>
+</section>
+
+<section class="pane" id="p4">
   <div class="head"><div><h1 data-i="un_title"></h1></div></div>
   <div class="seg"><button class="on" data-s="uprogs" onclick="usub('uprogs')" data-i="sub_uprogs"></button><button data-s="uwp" onclick="usub('uwp')" data-i="sub_uwp"></button></div>
   <div class="sp on" id="sp-uprogs">
@@ -1693,7 +2108,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 const $=id=>document.getElementById(id);
 let LANG='ar';
 const T={
-ar:{brand:'منظف الكمبيوتر',nav_home:'الرئيسية',nav_clean:'تنظيف وتسريع النظام',nav_setup:'تجهيز الويندوز بعد الفورمات',dark:'الوضع الداكن',collapse:'فتح / طيّ القائمة',
+ar:{brand:'منظف الكمبيوتر',nav_home:'الرئيسية',nav_clean:'تنظيف وتسريع النظام',nav_setup:'تثبيت البرامج',nav_settings:'إعدادات ويندوز',dark:'الوضع الداكن',collapse:'فتح / طيّ القائمة',
 hello:'أهلاً بيك',home_sub:'ده ملخص سريع لحالة جهازك.',free_lbl:'المساحة اللي تقدر تحررها',go_clean:'روح للتنظيف',ring_disk:'من القرص C:',
 c_cpu:'المعالج',c_ram:'الرامات',c_disk:'القرص (C:)',c_os:'النظام',ram_val:'{0} من {1}',disk_val:'فاضل {0} من {1}',up:'شغّال من {0} يوم و{1} ساعة',
 quick:'اختصارات سريعة',q_clean:'نظّف الجهاز',q_clean_s:'امسح الكاش والملفات المؤقتة',q_apps:'ثبّت برامجك',q_apps_s:'اختار برامجك وثبّتها مرة واحدة',q_set:'ضبط الإعدادات',q_set_s:'أهم إعدادات ويندوز',q_doc:'دكتور الجهاز',soon:'قريباً',
@@ -1709,14 +2124,20 @@ dl_kept:'اتنقل {0} عنصر ({1}) للمحذوفات المحفوظة لم�
 dl_freed:'اتحرر {0} نهائي.',dl_failed:'{0} عنصر معرفتش أتعامل معاه (مستخدم دلوقتي، أو على درايف مختلف). مفيش حاجة اتمسحت منهم.',
 loading:'جاري التحميل...',q_title:'المحذوفات المحفوظة',q_empty:'مفيش حاجة محفوظة دلوقتي.',q_auto:'بتتمسح لوحدها بعد {0} يوم.',q_left:'باقي {0} يوم',
 q_restore:'استرجاع المحدد',q_purge:'مسح نهائي',q_fail:'مقدرتش أرجع {0} عنصر',q_confirm_purge:'المسح ده نهائي ومفيهوش رجوع. متأكد؟',
-setup_title:'تجهيز الويندوز بعد الفورمات',sub_apps:'البرامج',sub_set:'الإعدادات',apps_sub:'اختار البرامج والأداة تثبّتها واحد ورا التاني من غير ما تفتح أي نافذة. بتتنزّل من مستودع winget الرسمي، فلازم يكون فيه إنترنت.',
+setup_title:'تثبيت البرامج بعد الفورمات',sub_apps:'البرامج',sub_set:'الإعدادات',apps_sub:'اختار البرامج والأداة تثبّتها واحد ورا التاني من غير ما تفتح أي نافذة. بتتنزّل من مستودع winget الرسمي، فلازم يكون فيه إنترنت.',
 sel_all:'اختار الكل',sel_none:'إلغاء الكل',selected:'المختار: {0}',install_sel:'ثبّت المختار',
 no_winget:'مش لاقي winget على الجهاز ده. محتاج ويندوز 10 (إصدار حديث) أو ويندوز 11، وبرنامج App Installer متحدّث من متجر مايكروسوفت.',
 st_wait:'في الانتظار',st_run:'جاري التثبيت...',st_ok:'اتثبّت ✅',st_had:'موجود قبل كده',st_fail:'فشل',
 installing:'بنثبّت {0} ({1} من {2})... ممكن ياخد دقايق',inst_done:'خلصنا: {0} تمام',inst_fail:'، و{0} فشلوا (جنب كل واحد كود الخطأ). جرّب تثبّتهم تاني، ولو فشلوا ابعت الكود للمطوّر.',inst_reboot:'. ممكن تحتاج تعيد تشغيل الجهاز.',
 note_one:'اختار برنامج حماية واحد بس. تثبيت أكتر من واحد بيعمل تعارض وبطء. وويندوز ديفندر بيقفل نفسه لوحده لما برنامج تاني يشتغل.',
 note_emu:'المحاكي بيشغّل ألعابك انت، وبعضها (زي PlayStation) بيحتاج ملف BIOS من جهازك الأصلي. الأداة بتثبّت المحاكي بس.',
-set_soon_title:'الإعدادات قريباً',set_soon_txt:'هنضيف هنا أهم إعدادات ويندوز بعد الفورمة، وكل إعداد بزرار تشغيل وإيقاف.',
+refresh:'تحديث',ref_done:'اتحدّث الساعة {0}',tw_title:'إعدادات ويندوز',tw_sub:'أهم الإعدادات اللي الناس بتغيّرها بعد الفورمة لتسريع الويندوز وتنضيفه. كل إعداد تقدر ترجّعه بضغطة.',
+tw_loading:'جاري قراءة الإعدادات...',tw_empty:'مفيش إعدادات متاحة',tw_on:'✓ مفعّل',tw_off:'غير مفعّل',tw_unknown:'غير معروف',tw_enable:'تفعيل الإعداد',tw_disable:'إلغاء تفعيل الإعداد',tw_admin:'يحتاج صلاحية مدير',
+tw_show:'اعرف التفاصيل',tw_hide:'إخفاء التفاصيل',tw_what:'إيه ده؟',tw_why:'الفايدة:',tw_note:'ملحوظة:',tw_rec:'موصى بيه',tw_opt:'اختياري',tw_need_exp:'محتاج إعادة تشغيل المستكشف',tw_need_login:'بيظهر بعد تسجيل الخروج والدخول',
+tw_nooff:'مفيش زرار إلغاء هنا لأن إيقاف حماية النظام بيمسح كل نقط الاستعادة اللي عندك.',tw_pend_exp:'فيه تغييرات محتاجة إعادة تشغيل المستكشف عشان تظهر (نوافذ المستكشف هتتقفل لحظة).',tw_restart_exp:'أعد تشغيل المستكشف الآن',
+tw_pend_login:'فيه تغييرات هتظهر بعد تسجيل الخروج والدخول تاني أو إعادة تشغيل الجهاز.',tw_fail:'معرفتش أغيّر: {0}',tw_rec_btn_n:'فعّل الموصى بيه ({0})',tw_rec_done:'الموصى بيه كله مفعّل ✅',
+tw_rec_title:'تفعيل الإعدادات الموصى بيها',tw_rec_txt:'هتتفعّل الإعدادات دي، وتقدر ترجّع أي واحدة بعد كده:',tw_rec_go:'فعّلهم',tw_applying:'جاري التطبيق...',tw_wait:'استنى لحظات.',
+tw_rec_result:'اتفعّل {0} إعداد.',tw_rec_failed:'{0} إعداد معرفتش أفعّله، جرّبه لوحده وشوف السبب.',
 upd_new:'فيه إصدار جديد: {0}',upd_btn:'حدّث الآن',upd_loading:'جاري التحميل... الأداة هتتقفل وتفتح تاني لوحدها',upd_fail:'فشل التحديث، هنكمل بالنسخة الحالية',
 ver:'الإصدار {0}',admin_yes:'صلاحية مدير ✓',admin_no:'بدون صلاحية مدير',
 nav_uninstall:'حذف البرامج',q_uninst:'حذف برامج',q_uninst_s:'شيل برامج من جهازك',un_title:'حذف البرامج',sub_uprogs:'البرامج',sub_uwp:'برامج ويندوز',
@@ -1728,7 +2149,7 @@ un_confirm_btn:'إزالة',un_removing:'جاري إزالة {0}...',un_done_ok:
 un_leftovers_btn:'دوّر على بقايا',un_leftovers_title:'بقايا {0}',un_leftovers_empty:'مفيش بقايا ظاهرة.',un_leftovers_loading:'جاري البحث...',
 un_leftovers_del:'امسح المختار',un_leftovers_done:'اتحرر {0}',un_leftovers_failed:'{0} عنصر معرفتش أمسحه',
 uwp_loading:'جاري تحميل برامج ويندوز...',uwp_empty:'مفيش برامج ظاهرة',},
-en:{brand:'PC Cleaner',nav_home:'Home',nav_clean:'Clean & Speed Up',nav_setup:'Set Up Windows After Format',dark:'Dark mode',collapse:'Open / collapse sidebar',
+en:{brand:'PC Cleaner',nav_home:'Home',nav_clean:'Clean & Speed Up',nav_setup:'Install Programs',nav_settings:'Windows Settings',dark:'Dark mode',collapse:'Open / collapse sidebar',
 hello:'Welcome back',home_sub:'A quick look at your PC.',free_lbl:'Space you can free up',go_clean:'Go to cleaning',ring_disk:'of disk C:',
 c_cpu:'Processor',c_ram:'Memory (RAM)',c_disk:'Disk (C:)',c_os:'System',ram_val:'{0} of {1}',disk_val:'{0} free of {1}',up:'Up for {0}d {1}h',
 quick:'Quick actions',q_clean:'Clean your PC',q_clean_s:'Remove cache and temporary files',q_apps:'Install your programs',q_apps_s:'Pick your apps and install them at once',q_set:'Windows settings',q_set_s:'Key Windows settings',q_doc:'PC Doctor',soon:'Coming soon',
@@ -1744,14 +2165,20 @@ dl_kept:'{0} items ({1}) were moved to Saved deletions for {2} days. You can res
 dl_freed:'{0} permanently freed.',dl_failed:'{0} items could not be handled (in use, or on another drive). Nothing was deleted from them.',
 loading:'Loading...',q_title:'Saved deletions',q_empty:'Nothing saved right now.',q_auto:'Automatically removed after {0} days.',q_left:'{0} days left',
 q_restore:'Restore selected',q_purge:'Delete permanently',q_fail:'Could not restore {0} items',q_confirm_purge:'This is permanent and cannot be undone. Sure?',
-setup_title:'Set Up Windows After Format',sub_apps:'Programs',sub_set:'Settings',apps_sub:'Pick programs and the tool installs them one after another, silently. They come from the official winget repository, so you need an internet connection.',
+setup_title:'Install Programs After Format',sub_apps:'Programs',sub_set:'Settings',apps_sub:'Pick programs and the tool installs them one after another, silently. They come from the official winget repository, so you need an internet connection.',
 sel_all:'Select all',sel_none:'Clear all',selected:'Selected: {0}',install_sel:'Install selected',
 no_winget:'winget was not found on this PC. You need a recent Windows 10 or Windows 11 with App Installer updated from the Microsoft Store.',
 st_wait:'Waiting',st_run:'Installing...',st_ok:'Installed ✅',st_had:'Already installed',st_fail:'Failed',
 installing:'Installing {0} ({1} of {2})... this may take a few minutes',inst_done:'Finished: {0} succeeded',inst_fail:', {0} failed (the error code is next to each one). Try again, and if they still fail send the code to the developer.',inst_reboot:'. You may need to restart your PC.',
 note_one:'Choose only one security program. Installing more than one causes conflicts and slowness, and Windows Defender turns itself off when another one runs.',
 note_emu:'An emulator runs your own games, and some (like PlayStation) need a BIOS file from your original console. The tool only installs the emulator.',
-set_soon_title:'Settings are coming soon',set_soon_txt:'Key Windows settings for a fresh install will appear here, each with an on/off switch.',
+refresh:'Refresh',ref_done:'Updated at {0}',tw_title:'Windows Settings',tw_sub:'The settings people most often change after a format to speed up and clean Windows. You can undo any of them with one click.',
+tw_loading:'Reading settings...',tw_empty:'No settings available',tw_on:'✓ On',tw_off:'Off',tw_unknown:'Unknown',tw_enable:'Turn on',tw_disable:'Turn off',tw_admin:'Needs administrator rights',
+tw_show:'Show details',tw_hide:'Hide details',tw_what:'What is it?',tw_why:'Why:',tw_note:'Note:',tw_rec:'Recommended',tw_opt:'Optional',tw_need_exp:'needs Explorer restart',tw_need_login:'appears after you sign out and in',
+tw_nooff:'There is no turn-off button here because turning off System Protection deletes all your restore points.',tw_pend_exp:'Some changes need File Explorer to restart to appear (Explorer windows will close for a moment).',tw_restart_exp:'Restart Explorer now',
+tw_pend_login:'Some changes will appear after you sign out and in again, or restart the PC.',tw_fail:'Could not change: {0}',tw_rec_btn_n:'Turn on recommended ({0})',tw_rec_done:'All recommended are on ✅',
+tw_rec_title:'Turn on recommended settings',tw_rec_txt:'These settings will be turned on, and you can undo any of them later:',tw_rec_go:'Turn them on',tw_applying:'Applying...',tw_wait:'Please wait a moment.',
+tw_rec_result:'{0} settings turned on.',tw_rec_failed:'{0} settings could not be turned on; try them one by one to see why.',
 upd_new:'New version available: {0}',upd_btn:'Update now',upd_loading:'Downloading... the app will close and reopen by itself',upd_fail:'Update failed; continuing with the current version',
 ver:'Version {0}',admin_yes:'Administrator ✓',admin_no:'No administrator rights',
 nav_uninstall:'Uninstall programs',q_uninst:'Remove programs',q_uninst_s:'Remove programs from your PC',un_title:'Uninstall programs',sub_uprogs:'Programs',sub_uwp:'Windows apps',
@@ -1791,6 +2218,7 @@ function applyLang(){
   refreshTexts();renderHome();
   if(S.length)render();
   if(appsLoaded)renderApps();
+  if(tweaksLoaded){renderTweaks();showPend()}
 }
 function toggleLang(){LANG=LANG==='ar'?'en':'ar';applyLang();api().set_pref('lang',LANG)}
 function curTheme(){const a=document.documentElement.getAttribute('data-theme');if(a)return a;return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}
@@ -1803,14 +2231,11 @@ function tab(n){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p'+n));
   if(n==='2'&&!appsLoaded)loadApps();
-  if(n==='3'&&!progsLoaded)loadPrograms();
-}
-function sub(x){
-  document.querySelectorAll('#p2 .seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
-  $('sp-apps').classList.toggle('on',x==='apps');$('sp-set').classList.toggle('on',x==='set');
+  if(n==='3'&&!tweaksLoaded)loadTweaks();
+  if(n==='4'&&!progsLoaded)loadPrograms();
 }
 function usub(x){
-  document.querySelectorAll('#p3 .seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
+  document.querySelectorAll('#p4 .seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===x));
   $('sp-uprogs').classList.toggle('on',x==='uprogs');$('sp-uwp').classList.toggle('on',x==='uwp');
   if(x==='uwp'&&!uwpLoaded)loadUwp();
 }
@@ -2030,6 +2455,94 @@ async function startInstall(){
   }
   prog(done,idx.length,L('inst_done',okc)+(bad?L('inst_fail',bad):L('inst_reboot')));
   busy=false;$('apps').classList.remove('lock');upd2();
+}
+
+/* ---- Windows settings tab ---- */
+let TW=[],TWG=[],tweaksLoaded=false,DET=new Set(),PEND=new Set(),twBusy=new Set(),refreshing=false;
+async function loadTweaks(){
+  if(!tweaksLoaded)$('tweaks').innerHTML='<p class="lbl">'+L('tw_loading')+'</p>';
+  const r=await api().get_tweaks();TW=r.items;TWG=r.groups;tweaksLoaded=true;renderTweaks();
+}
+function twCard(t,i){
+  const st=t.state,b=twBusy.has(t.key);
+  const badge=st===true?`<span class="badge safe">${L('tw_on')}</span>`:st===false?`<span class="badge mut">${L('tw_off')}</span>`:`<span class="badge mut">${L('tw_unknown')}</span>`;
+  let btn='';
+  if(t.locked)btn=`<button class="ghost" disabled>${L('tw_admin')}</button>`;
+  else if(st===true)btn=t.no_off?'':`<button class="ghost" ${b?'disabled':''} onclick="setTweak(${i},false)">${b?'...':L('tw_disable')}</button>`;
+  else if(st===false)btn=`<button class="pri" ${b?'disabled':''} onclick="setTweak(${i},true)">${b?'...':L('tw_enable')}</button>`;
+  const open=DET.has(t.key),note=pick(t,'note');
+  const sub=(t.rec?L('tw_rec'):L('tw_opt'))+(t.need==='explorer'?' · '+L('tw_need_exp'):t.need==='relogin'?' · '+L('tw_need_login'):'');
+  return `<div class="card tw ${t.rec?'safe':'caution'}"><div class="twrow"><div class="inf"><b>${esc(pick(t,'title'))}</b><small>${esc(sub)}</small></div>${badge}${btn}</div>
+  <div class="twmore"><button class="lnk" onclick="togDet('${t.key}')">${open?L('tw_hide'):L('tw_show')}</button>${open?`<div class="twd"><p><b>${L('tw_what')}</b> ${esc(pick(t,'what'))}</p><p><b>${L('tw_why')}</b> ${esc(pick(t,'why'))}</p>${note?`<p><b>${L('tw_note')}</b> ${esc(note)}</p>`:''}${t.no_off?`<p class="lbl">${L('tw_nooff')}</p>`:''}</div>`:''}</div></div>`;
+}
+function renderTweaks(){
+  if(!TW.length){$('tweaks').innerHTML='<p class="lbl">'+L('tw_empty')+'</p>';updRecBtn();return}
+  $('tweaks').innerHTML=TWG.map(g=>{
+    const its=TW.map((t,i)=>[t,i]).filter(x=>x[0].group===g.id);
+    return its.length?`<h3 class="gh">${esc(pick(g,'title'))}</h3>`+its.map(([t,i])=>twCard(t,i)).join(''):'';
+  }).join('');
+  updRecBtn();
+}
+function togDet(k){DET.has(k)?DET.delete(k):DET.add(k);renderTweaks()}
+async function setTweak(i,on){
+  const t=TW[i];if(!t||twBusy.has(t.key))return;
+  twBusy.add(t.key);renderTweaks();
+  let r;try{r=await api().set_tweak(t.key,on)}catch(e){r={ok:false,code:'error'}}
+  twBusy.delete(t.key);
+  if(r.state===true||r.state===false)t.state=r.state;
+  if(r.ok&&r.need)PEND.add(r.need);
+  renderTweaks();showPend();
+  if(!r.ok)showM(`<h3>${L('tw_fail',esc(pick(t,'title')))}</h3><p class="lbl">${esc(r.code||'')}</p><div class="row"><button class="pri" onclick="closeM()">${L('ok')}</button></div>`);
+}
+function showPend(){
+  const el=$('twnote');
+  if(!PEND.size){el.style.display='none';return}
+  let h='';
+  if(PEND.has('explorer'))h+=`<div>${L('tw_pend_exp')} <button class="ghost" onclick="restartExp()">${L('tw_restart_exp')}</button></div>`;
+  if(PEND.has('relogin'))h+=`<div>${L('tw_pend_login')}</div>`;
+  el.innerHTML=h;el.style.display='block';
+}
+async function restartExp(){await api().restart_explorer();PEND.delete('explorer');showPend()}
+function recList(){return TW.filter(t=>t.rec&&t.state===false&&!t.locked)}
+function updRecBtn(){const n=recList().length,b=$('twrec');b.disabled=!tweaksLoaded||n===0;b.textContent=n?L('tw_rec_btn_n',n):L('tw_rec_done')}
+function confirmRec(){
+  const l=recList();if(!l.length)return;
+  showM(`<h3>${L('tw_rec_title')}</h3><p class="lbl">${L('tw_rec_txt')}</p><ul>${l.map(t=>`<li><span>${esc(pick(t,'title'))}</span></li>`).join('')}</ul>
+  <label class="chk"><input type="checkbox" id="twrp" ${ADMIN?'checked':'disabled'}> ${L('make_rp')}${ADMIN?'':L('rp_admin')}</label>
+  <div class="row"><button class="pri" onclick="doRec()">${L('tw_rec_go')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
+}
+async function doRec(){
+  const rp=!!($('twrp')&&$('twrp').checked);
+  showM('<h3>'+L('tw_applying')+'</h3><p>'+(rp?L('rp_wait'):'')+L('tw_wait')+'</p>');
+  let r;try{r=await api().apply_recommended(rp)}catch(e){r={done:[],failed:[],needs:[],restore:'off'}}
+  r.needs.forEach(n=>PEND.add(n));
+  await loadTweaks();showPend();
+  let h=`<h3>${L('done')}</h3><p>${L('tw_rec_result',r.done.length)}</p>`;
+  if(r.restore==='ok')h+='<p>'+L('rp_ok')+'</p>';
+  if(r.restore==='failed')h+='<p>'+L('rp_fail')+'</p>';
+  if(r.failed.length)h+='<p>'+L('tw_rec_failed',r.failed.length)+'</p>';
+  showM(h+`<div class="row"><button class="pri" onclick="closeM()">${L('ok')}</button></div>`);
+}
+
+/* ---- refresh everything that is already loaded ---- */
+async function refApps(){
+  const r=await api().get_apps();WG=r.winget;const w=$('wg');
+  if(WG)w.style.display='none';else{w.style.display='block';w.textContent=L('no_winget')}
+  renderApps();
+}
+async function refreshAll(){
+  if(refreshing)return;refreshing=true;
+  const b=$('refb');b.disabled=true;b.classList.add('spin');
+  try{
+    const jobs=[api().get_home().then(h=>{H=h;renderHome()}).catch(()=>{}),load()];
+    if(appsLoaded&&!busy)jobs.push(refApps());
+    if(progsLoaded)jobs.push(loadPrograms());
+    if(uwpLoaded)jobs.push(loadUwp());
+    if(tweaksLoaded)jobs.push(loadTweaks());
+    await Promise.all(jobs);
+    $('refl').textContent=L('ref_done',new Date().toLocaleTimeString());
+  }catch(e){}
+  b.disabled=false;b.classList.remove('spin');refreshing=false;
 }
 
 async function doUpdate(){
