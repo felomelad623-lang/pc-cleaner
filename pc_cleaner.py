@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC Cache Cleaner - Windows only - Console version (step 1)
+PC Prof - Windows only - Console version (step 1)
 
 Scans well-known cache/temp locations, shows them as sections with sizes,
 and lets the user delete everything safe or pick sections.
@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.4"
+VERSION = "3.5"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -571,7 +572,7 @@ def parse_numbers(text, n):
 
 
 def main():
-    print(f"PC Cache Cleaner v{VERSION}")
+    print(f"PC Prof v{VERSION}")
     if "--no-update" not in sys.argv:
         if check_self_update():
             return
@@ -630,7 +631,7 @@ def create_restore_point() -> bool:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-             "Checkpoint-Computer -Description 'PC Cleaner' -RestorePointType MODIFY_SETTINGS -WarningAction Stop"],
+             "Checkpoint-Computer -Description 'PC Prof' -RestorePointType MODIFY_SETTINGS -WarningAction Stop"],
             capture_output=True, timeout=180, creationflags=0x08000000)
         return r.returncode == 0
     except Exception:
@@ -1585,6 +1586,250 @@ def _safe_check(key, fn, *args):
         return _chk(key, "info", key + "_unknown")
 
 
+# ------------------------------------------------------------- Windows files check (sfc / DISM / chkdsk / WMI / events)
+# Fixed commands only. The page sends a check name, never a command. The checks only read;
+# the two fixes (sfc /scannow, DISM /RestoreHealth) run only when the user presses the fix button.
+SC_KEYS = ("sfc", "dism", "disk", "wmi", "events")
+SC_FIX_KEYS = ("sfc", "dism")
+SC = {"running": False, "cancel": False, "proc": None, "cur": "", "step": 0, "total": 0,
+      "results": [], "done": False}
+SC_LOCK = threading.Lock()
+
+
+def _sc_res(key, level, msg, vals=None, fix=""):
+    return {"key": key, "level": level, "msg": msg, "vals": [str(v) for v in (vals or [])], "fix": fix}
+
+
+def _dec(b: bytes) -> str:
+    # sfc writes UTF-16 when its output is captured; the other tools write plain text
+    try:
+        if b"\x00" in b:
+            return b.decode("utf-16-le", errors="ignore")
+        return b.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _run_long(args, timeout=3600):
+    """Run a long tool in the background, writing its output to a temp file. Returns (code, text),
+    or (None, "") if the user cancelled or it ran out of time."""
+    path = os.path.join(tempfile.gettempdir(), "pcprof_out_%d.txt" % os.getpid())
+    try:
+        with open(path, "wb") as f:
+            proc = subprocess.Popen(args, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    creationflags=0x08000000)
+            SC["proc"] = proc
+            t0 = time.time()
+            while proc.poll() is None:
+                if SC["cancel"] or time.time() - t0 > timeout:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc.wait(timeout=30)
+                    return None, ""
+                time.sleep(0.5)
+        with open(path, "rb") as f:
+            data = f.read(200000)
+        return proc.returncode, _dec(data)
+    except Exception:
+        return None, ""
+    finally:
+        SC["proc"] = None
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _cbs_path():
+    return os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Logs", "CBS", "CBS.log")
+
+
+def _cbs_size():
+    try:
+        return os.path.getsize(_cbs_path())
+    except Exception:
+        return 0
+
+
+def _cbs_since(offset: int) -> str:
+    # language-independent fallback: read only what sfc added to the CBS log during this run
+    try:
+        with open(_cbs_path(), "rb") as f:
+            f.seek(offset)
+            return f.read(2000000).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def sc_sfc():
+    off = _cbs_size()
+    code, out = _run_long(["sfc", "/verifyonly"])
+    if code is None:
+        return None
+    low = out.lower()
+    if "did not find any integrity violations" in low:
+        return _sc_res("sfc", "ok", "sfc_ok")
+    if "found integrity violations" in low or "found corrupt files" in low:
+        return _sc_res("sfc", "bad", "sfc_bad", fix="sfc")
+    if "could not perform the requested operation" in low or "pending" in low:
+        return _sc_res("sfc", "info", "sfc_busy")
+    log = _cbs_since(off)  # Windows may be in another language: look at the log instead
+    if "Cannot repair member file" in log or "Cannot verify component" in log:
+        return _sc_res("sfc", "bad", "sfc_bad", fix="sfc")
+    if "Verify complete" in log:
+        return _sc_res("sfc", "ok", "sfc_ok")
+    return _sc_res("sfc", "info", "sfc_unknown")
+
+
+def _dism_scan(arg):
+    code, out = _run_long(["DISM", "/Online", "/Cleanup-Image", arg])
+    if code is None:
+        return None
+    low = out.lower()
+    if "no component store corruption detected" in low:
+        return "ok"
+    if "is repairable" in low:
+        return "bad"
+    return "unknown"
+
+
+def sc_dism():
+    SC["cur"] = "dism_check"
+    r = _dism_scan("/CheckHealth")  # quick one first
+    if r is None:
+        return None
+    if r == "ok":
+        SC["cur"] = "dism_scan"
+        r = _dism_scan("/ScanHealth")  # then the slow, thorough one
+        if r is None:
+            return None
+    if r == "ok":
+        return _sc_res("dism", "ok", "dism_ok")
+    if r == "bad":
+        return _sc_res("dism", "bad", "dism_bad", fix="dism")
+    return _sc_res("dism", "info", "dism_unknown")
+
+
+def sc_disk():
+    drive = os.environ.get("SystemDrive", "C:")
+    if not re.fullmatch(r"[A-Za-z]:", drive):
+        drive = "C:"
+    code, _ = _run_long(["chkdsk", drive, "/scan"])  # online scan: no /f, no restart needed
+    if code is None:
+        return None
+    if code == 0:
+        return _sc_res("disk", "ok", "disk_ok")
+    if code in (1, 2):
+        return _sc_res("disk", "warn", "disk_warn")
+    if code == 3:
+        return _sc_res("disk", "bad", "disk_bad")
+    return _sc_res("disk", "info", "disk_unknown")
+
+
+def sc_wmi():
+    code, out = _run_long(["winmgmt", "/verifyrepository"], 300)
+    if code is None:
+        return None
+    low = out.lower()
+    if "inconsistent" in low:
+        return _sc_res("wmi", "bad", "wmi_bad")
+    if "is consistent" in low:
+        return _sc_res("wmi", "ok", "wmi_ok")
+    try:  # other language: a real query tells us whether WMI answers at all
+        c2, _ = _ps("Get-CimInstance Win32_OperatingSystem -ErrorAction Stop | Out-Null", 60)
+        return _sc_res("wmi", "ok", "wmi_ok") if c2 == 0 else _sc_res("wmi", "bad", "wmi_bad")
+    except Exception:
+        return _sc_res("wmi", "info", "wmi_unknown")
+
+
+def sc_events():
+    cmd = ("(Get-WinEvent -FilterHashtable @{LogName='System','Application';Level=1;"
+           "StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue | Measure-Object).Count")
+    code, out = _ps(cmd, 120)
+    if code != 0 or not re.fullmatch(r"\d{1,6}", out.strip()):
+        return _sc_res("events", "info", "events_unknown")
+    n = int(out.strip())
+    if n == 0:
+        return _sc_res("events", "ok", "events_ok")
+    return _sc_res("events", "bad" if n >= 10 else "warn", "events_bad" if n >= 10 else "events_warn", [n])
+
+
+SC_FUNCS = {"sfc": sc_sfc, "dism": sc_dism, "disk": sc_disk, "wmi": sc_wmi, "events": sc_events}
+
+
+def sc_fix_sfc():
+    code, out = _run_long(["sfc", "/scannow"], 7200)
+    if code is None:
+        return None
+    low = out.lower()
+    if "requires reboot" in low or "pending" in low:
+        return _sc_res("sfc", "warn", "sfc_reboot")
+    if "successfully repaired" in low:
+        return _sc_res("sfc", "ok", "sfc_fixed")
+    if "unable to fix" in low:
+        return _sc_res("sfc", "bad", "sfc_unfixed")
+    if "did not find any integrity violations" in low:
+        return _sc_res("sfc", "ok", "sfc_ok")
+    return sc_sfc()  # unclear output: check again to know where we stand
+
+
+def sc_fix_dism():
+    code, _ = _run_long(["DISM", "/Online", "/Cleanup-Image", "/RestoreHealth"], 7200)
+    if code is None:
+        return None
+    if code == 0:
+        return _sc_res("dism", "ok", "dism_fixed")
+    return _sc_res("dism", "bad", "dism_fail", fix="dism")
+
+
+SC_FIX_FUNCS = {"sfc": sc_fix_sfc, "dism": sc_fix_dism}
+
+
+def _sc_put(res):
+    SC["results"] = [r for r in SC["results"] if r["key"] != res["key"]] + [res]
+    SC["results"].sort(key=lambda r: SC_KEYS.index(r["key"]))
+
+
+def _sc_job(fix=None, restore=False):
+    try:
+        if fix:
+            SC["total"] = 2 if restore else 1
+            SC["step"] = 0
+            if restore:
+                SC["cur"], SC["step"] = "rp", 1
+                sr = TWEAK_BY_KEY["restore"]
+                if tweak_state(sr) is not True:
+                    try:
+                        tweak_apply(sr, True)  # restore points need System Protection on
+                    except Exception:
+                        pass
+                create_restore_point()  # if it fails we still go on: the user already agreed to the fix
+            if not SC["cancel"]:
+                SC["cur"], SC["step"] = "fix_" + fix, SC["total"]
+                res = SC_FIX_FUNCS[fix]()
+                if res:
+                    _sc_put(res)
+        else:
+            SC["results"] = []
+            SC["total"] = len(SC_KEYS)
+            for i, k in enumerate(SC_KEYS, 1):
+                if SC["cancel"]:
+                    break
+                SC["cur"], SC["step"] = k, i
+                try:
+                    res = SC_FUNCS[k]()
+                except Exception:
+                    res = _sc_res(k, "info", k + "_unknown")
+                if res:
+                    _sc_put(res)
+    finally:
+        SC["running"] = False
+        SC["done"] = True
+        SC["cur"] = ""
+
+
 def default_lang() -> str:
     try:
         return "ar" if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x01 else "en"
@@ -1944,7 +2189,7 @@ class Api:
             p["lang"] = value
             try:
                 import webview
-                webview.windows[0].set_title("PC Cleaner" if value == "en" else "منظف الكمبيوتر")
+                webview.windows[0].set_title("PC Prof")
             except Exception:
                 pass
         elif key == "collapsed" and isinstance(value, bool):
@@ -1971,6 +2216,43 @@ class Api:
             if f_bat:
                 checks.append(f_bat.result())
         return {"checks": checks, "laptop": lap}
+
+    def start_syscheck(self):
+        if not is_admin():
+            return {"ok": False, "code": "admin"}
+        with SC_LOCK:
+            if SC["running"]:
+                return {"ok": False, "code": "busy"}
+            SC.update(running=True, cancel=False, done=False, cur="", step=0)
+        threading.Thread(target=_sc_job, daemon=True).start()
+        return {"ok": True}
+
+    def start_syscheck_fix(self, key, restore_point=False):
+        if not isinstance(key, str) or key not in SC_FIX_KEYS or not isinstance(restore_point, bool):
+            return {"ok": False, "code": "bad-key"}
+        if not is_admin():
+            return {"ok": False, "code": "admin"}
+        with SC_LOCK:
+            if SC["running"]:
+                return {"ok": False, "code": "busy"}
+            SC.update(running=True, cancel=False, done=False, cur="", step=0)
+        threading.Thread(target=_sc_job, args=(key, restore_point), daemon=True).start()
+        return {"ok": True}
+
+    def syscheck_status(self):
+        return {"running": SC["running"], "cancelled": SC["cancel"] and not SC["running"], "cur": SC["cur"],
+                "step": SC["step"], "total": SC["total"], "results": SC["results"], "done": SC["done"]}
+
+    def cancel_syscheck(self):
+        if SC["running"]:
+            SC["cancel"] = True
+            p = SC["proc"]
+            if p is not None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        return {"ok": True}
 
     def get_tweaks(self):
         admin, build, lap, out = is_admin(), win_build(), is_laptop(), []
@@ -2170,6 +2452,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 .badge{font-size:12px;padding:3px 11px;border-radius:20px;white-space:nowrap}
 .badge:empty{display:none}
 .badge.safe{background:#14b8a626;color:var(--ok)}.badge.caution{background:#f59e0b24;color:var(--warn)}.badge.risky{background:#f43f5e24;color:var(--bad)}.badge.mut{background:var(--line);color:var(--mut)}
+.pbar{height:8px;border-radius:8px;background:var(--line);overflow:hidden;margin:10px 0}.pbar i{display:block;height:100%;width:30%;border-radius:8px;background:linear-gradient(90deg,#5b3df5,#8b6bff);animation:scpb 1.3s ease-in-out infinite alternate}@keyframes scpb{from{margin-inline-start:0}to{margin-inline-start:70%}}
 .pulse{animation:pl 1.2s ease-in-out infinite}
 @keyframes pl{50%{opacity:.45}}
 .sz{min-width:92px;text-align:end;font-weight:600}.num{direction:ltr;unicode-bidi:isolate;display:inline-block}
@@ -2297,6 +2580,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <div class="head"><div><h1 data-i="dr_title"></h1><div class="lbl" data-i="dr_sub"></div></div><button class="pri" id="drgo" onclick="loadDoctor()" data-i="dr_scan"></button></div>
   <div class="stat" id="drsum" style="display:none;margin-bottom:14px"></div>
   <div id="drlist"></div>
+  <div class="head" style="margin-top:26px"><div><h1 style="font-size:19px" data-i="sc_title"></h1><div class="lbl" data-i="sc_sub"></div></div><div style="display:flex;gap:8px"><button class="pri" id="scgo" onclick="startSys()" data-i="sc_start"></button><button class="ghost" id="sccancel" onclick="cancelSys()" style="display:none" data-i="sc_cancel"></button></div></div>
+  <div id="scprog" style="display:none"><div class="lbl" id="sctxt"></div><div class="pbar"><i></i></div></div>
+  <div class="lbl" id="scmsg" style="margin-bottom:8px"></div>
+  <div id="sclist"></div>
 </section>
 
 <section class="pane" id="p4">
@@ -2320,7 +2607,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 const $=id=>document.getElementById(id);
 let LANG='ar';
 const T={
-ar:{brand:'منظف الكمبيوتر',nav_home:'الرئيسية',nav_clean:'تنظيف وتسريع النظام',nav_setup:'تثبيت البرامج',nav_settings:'إعدادات ويندوز',dark:'الوضع الداكن',collapse:'فتح / طيّ القائمة',
+ar:{brand:'PC Prof',nav_home:'الرئيسية',nav_clean:'تنظيف وتسريع النظام',nav_setup:'تثبيت البرامج',nav_settings:'إعدادات ويندوز',dark:'الوضع الداكن',collapse:'فتح / طيّ القائمة',
 hello:'أهلاً بيك',home_sub:'ده ملخص سريع لحالة جهازك.',free_lbl:'المساحة اللي تقدر تحررها',go_clean:'روح للتنظيف',ring_disk:'من القرص C:',
 c_cpu:'المعالج',c_ram:'الرامات',c_disk:'القرص (C:)',c_os:'النظام',ram_val:'{0} من {1}',disk_val:'فاضل {0} من {1}',up:'شغّال من {0} يوم و{1} ساعة',
 quick:'اختصارات سريعة',q_clean:'نظّف الجهاز',q_clean_s:'امسح الكاش والملفات المؤقتة',q_apps:'ثبّت برامجك',q_apps_s:'اختار برامجك وثبّتها مرة واحدة',q_set:'ضبط الإعدادات',q_set_s:'أهم إعدادات ويندوز',q_doc:'دكتور الجهاز',soon:'قريباً',
@@ -2365,6 +2652,15 @@ dr_reb_ok:'مفيش إعادة تشغيل معلّقة.',dr_reb_unknown:'معر�
 dr_def_ok:'الحماية شغّالة وقواعد الفحص محدّثة (عمرها {0} يوم).',dr_def_old:'الحماية شغّالة بس قواعد الفحص قديمة ({0} يوم). حدّث ويندوز.',dr_def_off:'مفيش مضاد فيروسات شغّال. فعّل Windows Defender من أمان ويندوز.',dr_def_other:'مضاد الفيروسات الشغّال: {0}.',dr_def_unknown:'معرفتش أقرا حالة الحماية. ممكن حماية التلاعب أو برنامج حماية بيمنع القراءة. افتح أمان ويندوز وشوف بنفسك.',
 dr_rp_ok:'نقاط الاستعادة مفعّلة.',dr_rp_off:'نقاط الاستعادة مقفولة، يعني لو حاجة باظت مفيش نقطة ترجع لها. فعّلها من الإعدادات.',dr_rp_unknown:'معرفتش أتأكد من نقاط الاستعادة.',
 dr_bat_ok:'البطارية محتفظة بـ {0}% من سعتها الأصلية. كويسة.',dr_bat_warn:'البطارية محتفظة بـ {0}% من سعتها بس. ضعفت شوية وهتفصل أسرع.',dr_bat_bad:'البطارية محتفظة بـ {0}% من سعتها بس. ضعيفة جداً، فكّر تبدّلها.',dr_bat_unknown:'معرفتش أقرا صحة البطارية على الجهاز ده.',
+sc_title:'فحص ملفات ويندوز',sc_sub:'بيشغّل أهم فحوصات ويندوز واحد ورا التاني. الفحص بيقرا بس ومبيغيّرش حاجة، وممكن ياخد من 10 لـ 30 دقيقة، فسيب الجهاز شغّال.',sc_start:'ابدأ الفحص',sc_cancel:'إلغاء',sc_running:'جاري الفحص ({0} من {1}): {2}',sc_cancelled:'الفحص اتلغى.',sc_admin:'الفحص ده محتاج تشغّل البرنامج بصلاحية مدير.',sc_busy:'فيه فحص شغّال بالفعل.',sc_fix:'صلّحها',sc_note_done:'خلص الفحص.',sc_none:'مفيش نتايج لسه. اضغط ابدأ الفحص.',
+sc_t_sfc:'ملفات النظام (SFC)',sc_t_dism:'مخزن مكونات ويندوز (DISM)',sc_t_disk:'أخطاء القرص (CHKDSK)',sc_t_wmi:'قاعدة بيانات الإدارة (WMI)',sc_t_events:'الأخطاء الحرجة في ويندوز',
+sc_cur_sfc:'فحص ملفات النظام',sc_cur_dism_check:'فحص سريع لمخزن المكونات',sc_cur_dism_scan:'فحص كامل لمخزن المكونات',sc_cur_disk:'فحص القرص',sc_cur_wmi:'فحص قاعدة بيانات WMI',sc_cur_events:'قراءة سجل الأحداث',sc_cur_fix_sfc:'إصلاح ملفات النظام',sc_cur_fix_dism:'إصلاح مخزن المكونات',sc_cur_rp:'عمل نقطة استعادة',
+sc_fix_conf_sfc:'هيشغّل إصلاح ملفات النظام. ممكن ياخد من 10 لـ 30 دقيقة، ومتقفلش البرنامج في الأثناء. نكمّل؟',sc_fix_conf_dism:'هيشغّل إصلاح مخزن مكونات ويندوز. محتاج إنترنت وممكن ياخد من 10 لـ 30 دقيقة، ومتقفلش البرنامج في الأثناء. نكمّل؟',sc_rp_ask:'تعمل نقطة استعادة قبل الإصلاح؟ (موصى بيه)\nموافق = أيوه اعمل نقطة، إلغاء = لأ كمّل من غيرها',sc_dism_first:'لو الاتنين فيهم مشكلة، صلّح مخزن المكونات (DISM) الأول وبعدين ارجع لملفات النظام.',
+sc_sfc_ok:'كل ملفات النظام سليمة.',sc_sfc_bad:'فيه ملفات نظام تالفة. اضغط صلّحها وويندوز هيرجّعها من نسخته الاحتياطية.',sc_sfc_busy:'ويندوز مقدرش يكمّل الفحص، ممكن يكون فيه تحديث شغّال في الخلفية. جرّب تاني بعد ما يخلص أو بعد Restart.',sc_sfc_unknown:'معرفتش أحدد نتيجة فحص ملفات النظام.',sc_sfc_fixed:'اتصلّحت ملفات النظام التالفة. اعمل Restart عشان يكتمل.',sc_sfc_unfixed:'ويندوز صلّح اللي يقدر عليه بس فيه ملفات مقدرش يصلّحها. صلّح مخزن المكونات (DISM) الأول وجرّب تاني، ولو لسه محتاج فنّي.',sc_sfc_reboot:'الإصلاح محتاج إعادة تشغيل عشان يكتمل. اعمل Restart وافحص تاني.',
+sc_dism_ok:'مخزن مكونات ويندوز سليم.',sc_dism_bad:'مخزن مكونات ويندوز فيه تلف ويمكن إصلاحه. اضغط صلّحها (محتاج إنترنت).',sc_dism_unknown:'معرفتش أحدد نتيجة فحص مخزن المكونات.',sc_dism_fixed:'اتصلّح مخزن المكونات. لو لسه فيه مشاكل افحص ملفات النظام تاني.',sc_dism_fail:'الإصلاح معرفش يخلص. اتأكد إن الإنترنت شغّال وجرّب تاني، ولو لسه محتاج فنّي.',
+sc_disk_ok:'مفيش أخطاء في القرص.',sc_disk_warn:'ويندوز لقى أخطاء بسيطة في القرص وصلّحها. افحص تاني للتأكد.',sc_disk_bad:'فيه أخطاء في القرص مش بتتصلّح والجهاز شغّال. انسخ ملفاتك المهمة احتياطي وبعدين اعمل فحص كامل للقرص.',sc_disk_unknown:'معرفتش أحدد نتيجة فحص القرص.',
+sc_wmi_ok:'قاعدة بيانات إدارة ويندوز سليمة.',sc_wmi_bad:'قاعدة بيانات إدارة ويندوز (WMI) فيها تلف، وده بيسبب أعطال غريبة في برامج كتير. محتاج فنّي أو إصلاح متقدم.',sc_wmi_unknown:'معرفتش أحدد نتيجة فحص WMI.',
+sc_events_ok:'مفيش أخطاء حرجة في آخر 7 أيام.',sc_events_warn:'فيه {0} خطأ حرج في آخر 7 أيام (زي إطفاء مفاجئ). لو الجهاز بيفصل لوحده خلّي فنّي يشوفه.',sc_events_bad:'فيه {0} أخطاء حرجة في آخر 7 أيام، وده كتير. ممكن يكون فيه مشكلة في الرامات أو الهارد أو الكهربا.',sc_events_unknown:'معرفتش أقرا سجل الأحداث.',
 refresh:'تحديث',ref_done:'اتحدّث الساعة {0}',tw_title:'إعدادات ويندوز',tw_sub:'أهم الإعدادات اللي الناس بتغيّرها بعد الفورمة لتسريع الويندوز وتنضيفه. كل إعداد تقدر ترجّعه بضغطة.',
 tw_loading:'جاري قراءة الإعدادات...',tw_empty:'مفيش إعدادات متاحة',tw_on:'✓ مفعّل',tw_off:'غير مفعّل',tw_unknown:'غير معروف',tw_enable:'تفعيل الإعداد',tw_disable:'إلغاء تفعيل الإعداد',tw_admin:'يحتاج صلاحية مدير',
 tw_show:'اعرف التفاصيل',tw_hide:'إخفاء التفاصيل',tw_what:'إيه ده؟',tw_why:'الفايدة:',tw_note:'ملحوظة:',tw_rec:'موصى بيه',tw_opt:'اختياري',tw_need_exp:'محتاج إعادة تشغيل المستكشف',tw_need_login:'بيظهر بعد تسجيل الخروج والدخول',
@@ -2383,7 +2679,7 @@ un_confirm_btn:'إزالة',un_removing:'جاري إزالة {0}...',un_done_ok:
 un_leftovers_btn:'دوّر على بقايا',un_leftovers_title:'بقايا {0}',un_leftovers_empty:'مفيش بقايا ظاهرة.',un_leftovers_loading:'جاري البحث...',
 un_leftovers_del:'امسح المختار',un_leftovers_done:'اتحرر {0}',un_leftovers_failed:'{0} عنصر معرفتش أمسحه',
 uwp_loading:'جاري تحميل برامج ويندوز...',uwp_empty:'مفيش برامج ظاهرة',},
-en:{brand:'PC Cleaner',nav_home:'Home',nav_clean:'Clean & Speed Up',nav_setup:'Install Programs',nav_settings:'Windows Settings',dark:'Dark mode',collapse:'Open / collapse sidebar',
+en:{brand:'PC Prof',nav_home:'Home',nav_clean:'Clean & Speed Up',nav_setup:'Install Programs',nav_settings:'Windows Settings',dark:'Dark mode',collapse:'Open / collapse sidebar',
 hello:'Welcome back',home_sub:'A quick look at your PC.',free_lbl:'Space you can free up',go_clean:'Go to cleaning',ring_disk:'of disk C:',
 c_cpu:'Processor',c_ram:'Memory (RAM)',c_disk:'Disk (C:)',c_os:'System',ram_val:'{0} of {1}',disk_val:'{0} free of {1}',up:'Up for {0}d {1}h',
 quick:'Quick actions',q_clean:'Clean your PC',q_clean_s:'Remove cache and temporary files',q_apps:'Install your programs',q_apps_s:'Pick your apps and install them at once',q_set:'Windows settings',q_set_s:'Key Windows settings',q_doc:'PC Doctor',soon:'Coming soon',
@@ -2428,6 +2724,15 @@ dr_reb_ok:'No restart is pending.',dr_reb_unknown:'Could not check for a pending
 dr_def_ok:'Protection is on and up to date (signatures are {0} days old).',dr_def_old:'Protection is on but its signatures are old ({0} days). Update Windows.',dr_def_off:'No antivirus is running. Turn on Windows Defender in Windows Security.',dr_def_other:'The antivirus running is: {0}.',dr_def_unknown:'Could not read the protection status. Tamper Protection or a security program may block reading. Open Windows Security and check by hand.',
 dr_rp_ok:'Restore points are on.',dr_rp_off:'Restore points are off, so if something breaks there is nothing to roll back to. Turn them on in Settings.',dr_rp_unknown:'Could not check restore points.',
 dr_bat_ok:'The battery keeps {0}% of its original capacity. Good.',dr_bat_warn:'The battery keeps only {0}% of its capacity. It has weakened and will drain faster.',dr_bat_bad:'The battery keeps only {0}% of its capacity. It is very weak; consider replacing it.',dr_bat_unknown:'Could not read the battery health on this PC.',
+sc_title:'Windows files check',sc_sub:'Runs the main Windows health checks one after another. The check only reads and changes nothing. It can take 10 to 30 minutes, so leave the PC on.',sc_start:'Start the check',sc_cancel:'Cancel',sc_running:'Checking ({0} of {1}): {2}',sc_cancelled:'The check was cancelled.',sc_admin:'This check needs the app to run as Administrator.',sc_busy:'A check is already running.',sc_fix:'Fix it',sc_note_done:'The check is done.',sc_none:'No results yet. Press Start the check.',
+sc_t_sfc:'System files (SFC)',sc_t_dism:'Windows component store (DISM)',sc_t_disk:'Disk errors (CHKDSK)',sc_t_wmi:'Management database (WMI)',sc_t_events:'Critical Windows errors',
+sc_cur_sfc:'Checking system files',sc_cur_dism_check:'Quick check of the component store',sc_cur_dism_scan:'Full check of the component store',sc_cur_disk:'Checking the disk',sc_cur_wmi:'Checking the WMI database',sc_cur_events:'Reading the event log',sc_cur_fix_sfc:'Repairing system files',sc_cur_fix_dism:'Repairing the component store',sc_cur_rp:'Creating a restore point',
+sc_fix_conf_sfc:'This will repair system files. It can take 10 to 30 minutes, and you should not close the app meanwhile. Continue?',sc_fix_conf_dism:'This will repair the Windows component store. It needs the internet and can take 10 to 30 minutes, and you should not close the app meanwhile. Continue?',sc_rp_ask:'Create a restore point before the repair? (recommended)\nOK = yes, make one. Cancel = no, continue without it',sc_dism_first:'If both have a problem, fix the component store (DISM) first, then come back to the system files.',
+sc_sfc_ok:'All system files are healthy.',sc_sfc_bad:'Some system files are damaged. Press Fix it and Windows will restore them from its backup copy.',sc_sfc_busy:'Windows could not finish the check. An update may be running in the background. Try again when it ends or after a Restart.',sc_sfc_unknown:'Could not work out the system files result.',sc_sfc_fixed:'The damaged system files were repaired. Restart to finish.',sc_sfc_unfixed:'Windows repaired what it could, but some files could not be fixed. Fix the component store (DISM) first and try again; if it persists, see a technician.',sc_sfc_reboot:'The repair needs a restart to finish. Restart and check again.',
+sc_dism_ok:'The Windows component store is healthy.',sc_dism_bad:'The Windows component store is damaged but can be repaired. Press Fix it (needs the internet).',sc_dism_unknown:'Could not work out the component store result.',sc_dism_fixed:'The component store was repaired. If problems remain, check the system files again.',sc_dism_fail:'The repair could not finish. Make sure the internet works and try again; if it persists, see a technician.',
+sc_disk_ok:'No disk errors found.',sc_disk_warn:'Windows found minor disk errors and fixed them. Check again to be sure.',sc_disk_bad:'There are disk errors that cannot be fixed while the PC is running. Back up your important files, then run a full disk check.',sc_disk_unknown:'Could not work out the disk check result.',
+sc_wmi_ok:'The Windows management database is healthy.',sc_wmi_bad:'The Windows management database (WMI) is damaged, which causes strange failures in many programs. It needs a technician or an advanced repair.',sc_wmi_unknown:'Could not work out the WMI result.',
+sc_events_ok:'No critical errors in the last 7 days.',sc_events_warn:'There were {0} critical errors in the last 7 days (such as a sudden power-off). If the PC shuts down by itself, have a technician look at it.',sc_events_bad:'There were {0} critical errors in the last 7 days, which is a lot. It may be a memory, disk or power problem.',sc_events_unknown:'Could not read the event log.',
 refresh:'Refresh',ref_done:'Updated at {0}',tw_title:'Windows Settings',tw_sub:'The settings people most often change after a format to speed up and clean Windows. You can undo any of them with one click.',
 tw_loading:'Reading settings...',tw_empty:'No settings available',tw_on:'✓ On',tw_off:'Off',tw_unknown:'Unknown',tw_enable:'Turn on',tw_disable:'Turn off',tw_admin:'Needs administrator rights',
 tw_show:'Show details',tw_hide:'Hide details',tw_what:'What is it?',tw_why:'Why:',tw_note:'Note:',tw_rec:'Recommended',tw_opt:'Optional',tw_need_exp:'needs Explorer restart',tw_need_login:'appears after you sign out and in',
@@ -2476,6 +2781,7 @@ function applyLang(){
   if(appsLoaded)renderApps();
   if(tweaksLoaded){renderTweaks();showPend()}
   if(doctorLoaded)renderDoctor();
+  renderSys();
 }
 function toggleLang(){LANG=LANG==='ar'?'en':'ar';applyLang();api().set_pref('lang',LANG)}
 function curTheme(){const a=document.documentElement.getAttribute('data-theme');if(a)return a;return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}
@@ -2818,6 +3124,50 @@ function renderDoctor(){
   }).join('')+`<div class="card safe"><div class="inf"><b>${L('dr_t_temp')}</b><small>${L('dr_temp_soon')}</small></div><span class="badge mut">${L('soon')}</span></div>`;
 }
 
+/* ---- Windows files check ---- */
+let SC=[],scTimer=null,scLast=null;
+function scErr(c){$('scmsg').textContent=c==='admin'?L('sc_admin'):c==='busy'?L('sc_busy'):''}
+async function startSys(){
+  let r;try{r=await api().start_syscheck()}catch(e){r={ok:false}}
+  if(!r.ok){scErr(r.code);return}
+  $('scmsg').textContent='';SC=[];pollSys();
+}
+async function fixSys(key){
+  if(!confirm(L('sc_fix_conf_'+key)))return;
+  const rp=confirm(L('sc_rp_ask'));
+  let r;try{r=await api().start_syscheck_fix(key,rp)}catch(e){r={ok:false}}
+  if(!r.ok){scErr(r.code);return}
+  $('scmsg').textContent='';pollSys();
+}
+async function cancelSys(){try{await api().cancel_syscheck()}catch(e){}}
+function pollSys(){
+  clearInterval(scTimer);
+  const tick=async()=>{
+    let s;try{s=await api().syscheck_status()}catch(e){return}
+    scLast=s;SC=s.results||[];renderSys();
+    if(!s.running){clearInterval(scTimer);scTimer=null}
+  };
+  tick();scTimer=setInterval(tick,1000);
+}
+function renderSys(){
+  const s=scLast;if(!s)return;
+  const run=!!s.running;
+  $('scgo').disabled=run;$('sccancel').style.display=run?'':'none';
+  $('scprog').style.display=run?'block':'none';
+  if(run)$('sctxt').textContent=L('sc_running',s.step,s.total,L('sc_cur_'+s.cur));
+  else if(s.cancelled)$('scmsg').textContent=L('sc_cancelled');
+  else if(s.done&&!$('scmsg').textContent)$('scmsg').textContent=L('sc_note_done');
+  const LV={ok:['dr_lv_ok','safe'],warn:['dr_lv_warn','caution'],bad:['dr_lv_bad','risky'],info:['dr_lv_info','mut']};
+  const dismBad=SC.some(c=>c.key==='dism'&&c.level==='bad');
+  $('sclist').innerHTML=SC.map(c=>{
+    const lv=LV[c.level]||LV.info;
+    const hold=c.fix==='sfc'&&dismBad;
+    const btn=c.fix&&!hold?`<button class="ghost" ${run?'disabled':''} onclick="fixSys('${c.fix}')">${L('sc_fix')}</button>`:'';
+    const extra=hold?`<small>${L('sc_dism_first')}</small>`:'';
+    return `<div class="card ${lv[1]==='mut'?'safe':lv[1]}"><div class="inf"><b>${L('sc_t_'+c.key)}</b><small>${esc(L('sc_'+c.msg,...(c.vals||[])))}</small>${extra}</div><span class="badge ${lv[1]}">${L(lv[0])}</span>${btn}</div>`;
+  }).join('');
+}
+
 /* ---- refresh everything that is already loaded ---- */
 async function refApps(){
   const r=await api().get_apps();WG=r.winget;const w=$('wg');
@@ -2861,7 +3211,7 @@ def gui_main():
     import webview
     lang = prefs_load().get("lang")
     lang = lang if lang in ("ar", "en") else default_lang()
-    webview.create_window("PC Cleaner" if lang == "en" else "منظف الكمبيوتر", html=HTML, js_api=Api(),
+    webview.create_window("PC Prof", html=HTML, js_api=Api(),
                           width=1100, height=760, min_size=(860, 580))
     webview.start()
 
@@ -2876,7 +3226,7 @@ def entry():
         if getattr(sys, "frozen", False):
             ctypes.windll.user32.MessageBoxW(
                 0, "Could not open the window.\nPlease install 'Microsoft Edge WebView2 Runtime' from Microsoft.",
-                "PC Cleaner", 0x10)
+                "PC Prof", 0x10)
         else:
             print(f"GUI could not start ({e}). Using console mode.")
             main()
