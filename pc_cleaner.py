@@ -40,7 +40,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.5"
+VERSION = "3.6"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -1956,6 +1956,101 @@ AR = {
 }
 
 
+# ------------------------------------------------------------- External health tools (stages 1 and 2)
+# Stage 1: tell the user which free programs to install and check they are installed (fixed winget ids,
+# reused from APPS). Stage 2: tell the user how to scan with each one and take the report they hand over.
+# The reports are kept in memory only (never written to disk, never sent anywhere) until stage 3 reads them.
+HT_MAX_CHARS = 2_000_000
+HT_TOOLS = [
+    {"k": "hwmonitor", "app": "hwmonitor", "match": "hwmonitor", "kind": "file",
+     "exe": [r"CPUID\HWMonitor\HWMonitor.exe"]},
+    {"k": "crystaldisk", "app": "crystaldisk", "match": "crystaldiskinfo", "kind": "file",
+     "exe": [r"CrystalDiskInfo\DiskInfo64.exe", r"CrystalDiskInfo\DiskInfo32.exe"]},
+    {"k": "memdiag", "app": None, "match": "", "kind": "event", "exe": []},  # built into Windows
+]
+HT_BY_KEY = {t["k"]: t for t in HT_TOOLS}
+HT_REPORTS = {}  # key -> {"name", "size", "text", "when", "state"}
+HT_MEM_PASS = (1201, 1101)
+HT_MEM_FAIL = (1202, 1102)
+
+
+def _ht_dirs():
+    return [d for d in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if d]
+
+
+def ht_exe(t) -> str:
+    for base in _ht_dirs():
+        for rel in t["exe"]:
+            path = os.path.join(base, rel)
+            if os.path.isfile(path):
+                return path
+    return ""
+
+
+def ht_installed(t, progs) -> bool:
+    if t["app"] is None:
+        return True
+    if ht_exe(t):
+        return True
+    return any(t["match"] in str(p.get("name", "")).lower().replace(" ", "") for p in progs)
+
+
+def _ht_decode(b: bytes) -> str:
+    if b[:3] == b"\xef\xbb\xbf":
+        return b[3:].decode("utf-8", errors="ignore")
+    if b[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return b.decode("utf-16", errors="ignore")
+    if b"\x00" in b[:400]:
+        return b.decode("utf-16-le", errors="ignore")
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("cp1252", errors="ignore")
+
+
+def ht_store(key, text, name="", append=False):
+    text = (text or "").replace("\r\n", "\n").strip()
+    if len(text) < 20:
+        return {"ok": False, "code": "empty"}
+    sample = text[:4000]
+    odd = sum(1 for c in sample if ord(c) < 9 or 13 < ord(c) < 32)
+    if odd > len(sample) * 0.1:
+        return {"ok": False, "code": "binary"}
+    old = HT_REPORTS.get(key)
+    if append and old and not old.get("name"):
+        text = old["text"] + "\n\n" + text  # several pasted pieces (e.g. one per disk) pile up
+    if len(text) > HT_MAX_CHARS:
+        return {"ok": False, "code": "too-big"}
+    HT_REPORTS[key] = {"name": name, "size": len(text.encode("utf-8")), "text": text,
+                       "when": time.strftime("%Y-%m-%d %H:%M"), "state": ""}
+    return {"ok": True}
+
+
+def ht_memdiag_read():
+    """Read the newest Windows Memory Diagnostic result from the System event log."""
+    cmd = ("Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-MemoryDiagnostics-Results'} "
+           "-MaxEvents 6 -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{id=[int]$_.Id; "
+           "t=$_.TimeCreated.ToString('s')} } | ConvertTo-Json -Compress")
+    code, out = _ps(cmd, 60)
+    if code != 0:
+        return {"state": "unknown", "when": ""}
+    if not out.strip():
+        return {"state": "none", "when": ""}
+    try:
+        data = json.loads(out)
+    except Exception:
+        return {"state": "unknown", "when": ""}
+    rows = [data] if isinstance(data, dict) else [r for r in data if isinstance(r, dict)]
+    rows = [r for r in rows if isinstance(r.get("id"), int) and isinstance(r.get("t"), str)]
+    rows.sort(key=lambda r: r["t"], reverse=True)
+    for r in rows:
+        if r["id"] in HT_MEM_PASS:
+            return {"state": "pass", "when": r["t"].replace("T", " ")[:16]}
+        if r["id"] in HT_MEM_FAIL:
+            return {"state": "fail", "when": r["t"].replace("T", " ")[:16]}
+    return {"state": "none", "when": ""}
+
+
 class Api:
     """Functions the web page can call. The page never sends file paths, only section names / list numbers."""
 
@@ -2253,6 +2348,85 @@ class Api:
                 except Exception:
                     pass
         return {"ok": True}
+
+    def get_health_tools(self):
+        try:
+            progs = list_installed_programs()
+        except Exception:
+            progs = []
+        out = []
+        for t in HT_TOOLS:
+            rep = HT_REPORTS.get(t["k"])
+            out.append({"key": t["k"], "kind": t["kind"], "builtin": t["app"] is None,
+                        "installed": ht_installed(t, progs), "has_exe": bool(ht_exe(t)),
+                        "got": ({"name": rep["name"], "size": rep["size"], "when": rep["when"],
+                                 "state": rep.get("state", "")} if rep else None)})
+        return {"tools": out, "winget": find_winget() is not None}
+
+    def ht_install(self, key):
+        t = HT_BY_KEY.get(key) if isinstance(key, str) else None
+        if not t or t["app"] is None:
+            return {"state": "fail", "code": "bad-key"}
+        state, code = winget_install(t["app"])
+        return {"state": state, "code": code}
+
+    def ht_open(self, key):
+        t = HT_BY_KEY.get(key) if isinstance(key, str) else None
+        if not t:
+            return {"ok": False, "code": "bad-key"}
+        if t["kind"] == "event":
+            path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "mdsched.exe")
+        else:
+            path = ht_exe(t)
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "code": "not-found"}
+        try:
+            subprocess.Popen([path], cwd=os.path.dirname(path))
+        except Exception:
+            return {"ok": False, "code": "not-found"}
+        return {"ok": True}
+
+    def ht_pick_file(self, key):
+        t = HT_BY_KEY.get(key) if isinstance(key, str) else None
+        if not t or t["kind"] != "file":
+            return {"ok": False, "code": "bad-key"}
+        try:
+            import webview
+            kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
+            res = webview.windows[0].create_file_dialog(
+                kind, allow_multiple=False, file_types=("Text files (*.txt;*.csv;*.log)", "All files (*.*)"))
+        except Exception:
+            return {"ok": False, "code": "dialog"}
+        if not res:
+            return {"ok": False, "code": "cancel"}
+        path = res[0] if isinstance(res, (list, tuple)) else res
+        try:
+            if os.path.getsize(path) > HT_MAX_CHARS * 2:
+                return {"ok": False, "code": "too-big"}
+            with open(path, "rb") as f:
+                data = f.read(HT_MAX_CHARS * 2 + 1)
+        except (OSError, TypeError):
+            return {"ok": False, "code": "read"}
+        return ht_store(key, _ht_decode(data), os.path.basename(str(path)))
+
+    def ht_paste(self, key, text):
+        t = HT_BY_KEY.get(key) if isinstance(key, str) else None
+        if not t or t["kind"] != "file" or not isinstance(text, str):
+            return {"ok": False, "code": "bad-key"}
+        if len(text) > HT_MAX_CHARS:
+            return {"ok": False, "code": "too-big"}
+        return ht_store(key, text, "", append=True)
+
+    def ht_clear(self, key):
+        if isinstance(key, str):
+            HT_REPORTS.pop(key, None)
+        return {"ok": True}
+
+    def ht_memdiag(self):
+        r = ht_memdiag_read()
+        if r["state"] in ("pass", "fail"):
+            HT_REPORTS["memdiag"] = {"name": "", "size": 0, "text": "", "when": r["when"], "state": r["state"]}
+        return r
 
     def get_tweaks(self):
         admin, build, lap, out = is_admin(), win_build(), is_laptop(), []
@@ -2584,6 +2758,12 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
   <div id="scprog" style="display:none"><div class="lbl" id="sctxt"></div><div class="pbar"><i></i></div></div>
   <div class="lbl" id="scmsg" style="margin-bottom:8px"></div>
   <div id="sclist"></div>
+  <div class="head" style="margin-top:26px"><div><h1 style="font-size:19px" data-i="ht_title"></h1><div class="lbl" data-i="ht_sub"></div></div><div style="display:flex;gap:8px"><button class="pri" id="htall" onclick="htInstallAll()" style="display:none" data-i="ht_install_all"></button><button class="ghost" id="htre" onclick="loadHT()" data-i="ht_recheck"></button></div></div>
+  <div id="hts" style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap"></div>
+  <div class="lbl" id="htmsg" style="margin-bottom:6px"></div>
+  <div class="lbl" id="htnote" style="margin-bottom:8px;font-weight:600"></div>
+  <div id="htlist"></div>
+  <div class="lbl" style="margin-top:6px" data-i="ht_privacy"></div>
 </section>
 
 <section class="pane" id="p4">
@@ -2661,6 +2841,17 @@ sc_dism_ok:'مخزن مكونات ويندوز سليم.',sc_dism_bad:'مخزن 
 sc_disk_ok:'مفيش أخطاء في القرص.',sc_disk_warn:'ويندوز لقى أخطاء بسيطة في القرص وصلّحها. افحص تاني للتأكد.',sc_disk_bad:'فيه أخطاء في القرص مش بتتصلّح والجهاز شغّال. انسخ ملفاتك المهمة احتياطي وبعدين اعمل فحص كامل للقرص.',sc_disk_unknown:'معرفتش أحدد نتيجة فحص القرص.',
 sc_wmi_ok:'قاعدة بيانات إدارة ويندوز سليمة.',sc_wmi_bad:'قاعدة بيانات إدارة ويندوز (WMI) فيها تلف، وده بيسبب أعطال غريبة في برامج كتير. محتاج فنّي أو إصلاح متقدم.',sc_wmi_unknown:'معرفتش أحدد نتيجة فحص WMI.',
 sc_events_ok:'مفيش أخطاء حرجة في آخر 7 أيام.',sc_events_warn:'فيه {0} خطأ حرج في آخر 7 أيام (زي إطفاء مفاجئ). لو الجهاز بيفصل لوحده خلّي فنّي يشوفه.',sc_events_bad:'فيه {0} أخطاء حرجة في آخر 7 أيام، وده كتير. ممكن يكون فيه مشكلة في الرامات أو الهارد أو الكهربا.',sc_events_unknown:'معرفتش أقرا سجل الأحداث.',
+ht_title:'الفحص الشامل بأدوات خارجية',ht_sub:'كام برنامج مجاني متخصص بيقيسوا حاجات ويندوز نفسه مبيقيسهاش (الحرارة وصحة الهارد والرامات). ثبّتهم، افحص بيهم، وسلّم التقارير للأداة.',ht_s1:'1. التثبيت',ht_s2:'2. الفحص',ht_s3:'3. التحليل الشامل (قريباً)',ht_install:'ثبّته',ht_install_all:'ثبّت الناقص',ht_recheck:'اتأكد من التثبيت',ht_installing:'جاري التثبيت...',
+ht_inst:'متسطّب',ht_notinst:'مش متسطّب',ht_builtin:'مدمج في ويندوز',ht_stage1_msg:'ثبّت البرامج الناقصة الأول. أول ما تخلص الأداة هتفتحلك خطوات الفحص.',ht_stage2_msg:'كل البرامج جاهزة. اعمل الفحص بكل برنامج حسب الخطوات وسلّم تقريره.',
+ht_open:'افتح البرنامج',ht_pick:'اختار ملف التقرير',ht_paste:'الصق المعلومات',ht_clear:'مسح',ht_memrun:'ابدأ فحص الرامات',ht_memread:'اقرا النتيجة',ht_got:'اتسلّم: {0} ({1} KB)',ht_got_paste:'اتسلّمت المعلومات ({0} KB)',ht_not_got:'لسه ماتسلّمش تقرير.',
+ht_stage3:'لما تسلّم كل التقارير، الأداة هتحلّلهم وتطلّعلك تقرير واحد بسيط. التحليل ده لسه مش متاح.',ht_privacy:'التقارير بتفضل في ذاكرة البرنامج على جهازك بس، ومبتتحفظش ومبتتبعتش لأي مكان.',
+ht_paste_title:'الصق معلومات الفحص',ht_paste_hint:'اعمل Paste (Ctrl+V) في الخانة وبعدين اضغط حفظ. لو عندك أكتر من هارد، كل مرة هتتضاف المعلومات للي قبلها.',ht_paste_save:'حفظ',
+ht_n_hwmonitor:'HWMonitor',ht_w_hwmonitor:'بيقيس حرارة المعالج والكارت وسرعة المراوح والفولت.',ht_n_crystaldisk:'CrystalDiskInfo',ht_w_crystaldisk:'بيقرا حالة الهارد أو الـ SSD من بيانات SMART ويقولك صحته ودرجة حرارته.',ht_n_memdiag:'فحص ذاكرة ويندوز',ht_w_memdiag:'أداة ويندوز المدمجة بتختبر الرامات. مفيش تثبيت.',
+ht_st_hwmonitor:'افتح البرنامج واستنى ثواني لحد ما الأرقام تظهر.|للحصول على أرقام واقعية، سيب الجهاز شغّال تحت استخدام عادي (أو شغّل فيديو أو لعبة) حوالي 5 دقايق.|من قايمة File اختار Save Monitoring Data واحفظ الملف (txt).|ارجع هنا واضغط اختار ملف التقرير.',
+ht_st_crystaldisk:'افتح البرنامج، وهيعرض حالة الهارد (Good أو Caution أو Bad).|من قايمة Edit اختار Copy.|ارجع هنا واضغط الصق المعلومات، واعمل Paste في الخانة واضغط حفظ.|لو عندك أكتر من هارد، اختار كل واحد من الأعلى في البرنامج وكرر الخطوتين، والمعلومات هتتجمّع.',
+ht_st_memdiag:'اضغط ابدأ فحص الرامات وهتظهر نافذة ويندوز.|اختار Restart now (احفظ شغلك الأول). الجهاز هيعيد التشغيل ويفحص الرامات، وده ممكن ياخد وقت.|بعد ما ويندوز يفتح، ارجع هنا واضغط اقرا النتيجة.|لو النتيجة مظهرتش، ممكن ويندوز ما حفظهاش (مثلاً لو الجهاز طلب مفتاح التشفير BitLocker وقت الفحص). اعمل الفحص تاني.',
+ht_mem_pass:'فحص الرامات خلص وملقاش أخطاء ({0}).',ht_mem_fail:'فحص الرامات لقى أخطاء ({0}). ده معناه احتمال إن شريحة رامات فيها مشكلة.',ht_mem_none:'مفيش نتيجة فحص رامات متسجّلة لحد دلوقتي. لو لسه ماعملتش الفحص ابدأه.',ht_mem_unknown:'معرفتش أقرا نتيجة فحص الرامات.',
+ht_er_empty:'الملف أو النص فاضي أو قصير جداً.',ht_er_big:'الحجم كبير أوي، التقرير المفروض يبقى صغير.',ht_er_bin:'ده مش ملف نصي. اختار ملف التقرير (txt).',ht_er_dialog:'معرفتش أفتح نافذة اختيار الملف.',ht_er_read:'معرفتش أقرا الملف.',ht_er_open:'معرفتش أفتح البرنامج. افتحه من قايمة ابدأ.',ht_saved:'اتسلّم التقرير.',
 refresh:'تحديث',ref_done:'اتحدّث الساعة {0}',tw_title:'إعدادات ويندوز',tw_sub:'أهم الإعدادات اللي الناس بتغيّرها بعد الفورمة لتسريع الويندوز وتنضيفه. كل إعداد تقدر ترجّعه بضغطة.',
 tw_loading:'جاري قراءة الإعدادات...',tw_empty:'مفيش إعدادات متاحة',tw_on:'✓ مفعّل',tw_off:'غير مفعّل',tw_unknown:'غير معروف',tw_enable:'تفعيل الإعداد',tw_disable:'إلغاء تفعيل الإعداد',tw_admin:'يحتاج صلاحية مدير',
 tw_show:'اعرف التفاصيل',tw_hide:'إخفاء التفاصيل',tw_what:'إيه ده؟',tw_why:'الفايدة:',tw_note:'ملحوظة:',tw_rec:'موصى بيه',tw_opt:'اختياري',tw_need_exp:'محتاج إعادة تشغيل المستكشف',tw_need_login:'بيظهر بعد تسجيل الخروج والدخول',
@@ -2733,6 +2924,17 @@ sc_dism_ok:'The Windows component store is healthy.',sc_dism_bad:'The Windows co
 sc_disk_ok:'No disk errors found.',sc_disk_warn:'Windows found minor disk errors and fixed them. Check again to be sure.',sc_disk_bad:'There are disk errors that cannot be fixed while the PC is running. Back up your important files, then run a full disk check.',sc_disk_unknown:'Could not work out the disk check result.',
 sc_wmi_ok:'The Windows management database is healthy.',sc_wmi_bad:'The Windows management database (WMI) is damaged, which causes strange failures in many programs. It needs a technician or an advanced repair.',sc_wmi_unknown:'Could not work out the WMI result.',
 sc_events_ok:'No critical errors in the last 7 days.',sc_events_warn:'There were {0} critical errors in the last 7 days (such as a sudden power-off). If the PC shuts down by itself, have a technician look at it.',sc_events_bad:'There were {0} critical errors in the last 7 days, which is a lot. It may be a memory, disk or power problem.',sc_events_unknown:'Could not read the event log.',
+ht_title:'Full check with external tools',ht_sub:'A few free specialist programs measure things Windows itself does not (temperature, disk health, memory). Install them, scan with them, and hand the reports to the app.',ht_s1:'1. Install',ht_s2:'2. Scan',ht_s3:'3. Full analysis (soon)',ht_install:'Install',ht_install_all:'Install the missing ones',ht_recheck:'Check installation',ht_installing:'Installing...',
+ht_inst:'Installed',ht_notinst:'Not installed',ht_builtin:'Built into Windows',ht_stage1_msg:'Install the missing programs first. When they are done, the app will open the scan steps.',ht_stage2_msg:'All programs are ready. Scan with each one following its steps and hand over its report.',
+ht_open:'Open the program',ht_pick:'Choose the report file',ht_paste:'Paste the information',ht_clear:'Clear',ht_memrun:'Start the memory check',ht_memread:'Read the result',ht_got:'Received: {0} ({1} KB)',ht_got_paste:'Information received ({0} KB)',ht_not_got:'No report received yet.',
+ht_stage3:'Once you hand over all the reports, the app will analyze them and give you one simple report. That analysis is not available yet.',ht_privacy:'Reports stay in the app memory on your PC only. They are not saved and not sent anywhere.',
+ht_paste_title:'Paste the scan information',ht_paste_hint:'Press Ctrl+V in the box, then Save. If you have more than one disk, each time the information is added to the previous one.',ht_paste_save:'Save',
+ht_n_hwmonitor:'HWMonitor',ht_w_hwmonitor:'Measures CPU and graphics card temperature, fan speed and voltage.',ht_n_crystaldisk:'CrystalDiskInfo',ht_w_crystaldisk:'Reads the health of the hard disk or SSD from its SMART data, with its temperature.',ht_n_memdiag:'Windows Memory Diagnostic',ht_w_memdiag:'The tool built into Windows that tests memory. Nothing to install.',
+ht_st_hwmonitor:'Open the program and wait a few seconds until the numbers appear.|For realistic numbers, keep the PC under normal use (or play a video or game) for about 5 minutes.|From the File menu choose Save Monitoring Data and save the txt file.|Come back here and press Choose the report file.',
+ht_st_crystaldisk:'Open the program. It shows the disk status (Good, Caution or Bad).|From the Edit menu choose Copy.|Come back here, press Paste the information, press Ctrl+V in the box and Save.|If you have more than one disk, pick each one at the top of the program and repeat the two steps. The information is gathered together.',
+ht_st_memdiag:'Press Start the memory check and a Windows window appears.|Choose Restart now (save your work first). The PC restarts and tests the memory, which can take a while.|After Windows opens, come back here and press Read the result.|If no result shows up, Windows may not have saved it (for example if the PC asked for the BitLocker recovery key during the test). Run the check again.',
+ht_mem_pass:'The memory check finished and found no errors ({0}).',ht_mem_fail:'The memory check found errors ({0}). This suggests a memory module may have a problem.',ht_mem_none:'No memory check result is recorded yet. If you have not run it, start it.',ht_mem_unknown:'Could not read the memory check result.',
+ht_er_empty:'The file or text is empty or too short.',ht_er_big:'It is too large. The report should be small.',ht_er_bin:'This is not a text file. Choose the report file (txt).',ht_er_dialog:'Could not open the file chooser.',ht_er_read:'Could not read the file.',ht_er_open:'Could not open the program. Open it from the Start menu.',ht_saved:'Report received.',
 refresh:'Refresh',ref_done:'Updated at {0}',tw_title:'Windows Settings',tw_sub:'The settings people most often change after a format to speed up and clean Windows. You can undo any of them with one click.',
 tw_loading:'Reading settings...',tw_empty:'No settings available',tw_on:'✓ On',tw_off:'Off',tw_unknown:'Unknown',tw_enable:'Turn on',tw_disable:'Turn off',tw_admin:'Needs administrator rights',
 tw_show:'Show details',tw_hide:'Hide details',tw_what:'What is it?',tw_why:'Why:',tw_note:'Note:',tw_rec:'Recommended',tw_opt:'Optional',tw_need_exp:'needs Explorer restart',tw_need_login:'appears after you sign out and in',
@@ -2781,7 +2983,7 @@ function applyLang(){
   if(appsLoaded)renderApps();
   if(tweaksLoaded){renderTweaks();showPend()}
   if(doctorLoaded)renderDoctor();
-  renderSys();
+  renderSys();renderHT();
 }
 function toggleLang(){LANG=LANG==='ar'?'en':'ar';applyLang();api().set_pref('lang',LANG)}
 function curTheme(){const a=document.documentElement.getAttribute('data-theme');if(a)return a;return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}
@@ -2795,6 +2997,7 @@ function tab(n){
   document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.id==='p'+n));
   if(n==='2'&&!appsLoaded)loadApps();
   if(n==='5'&&!doctorLoaded)loadDoctor();
+  if(n==='5'&&!htLoaded)loadHT();
   if(n==='3'&&!tweaksLoaded)loadTweaks();
   if(n==='4'&&!progsLoaded)loadPrograms();
 }
@@ -3168,6 +3371,87 @@ function renderSys(){
   }).join('');
 }
 
+/* ---- External health tools (stages 1 and 2) ---- */
+let HTL=[],HTW=true,htLoaded=false,htBusy=false;
+const HTER={'empty':'ht_er_empty','too-big':'ht_er_big','binary':'ht_er_bin','dialog':'ht_er_dialog','read':'ht_er_read','not-found':'ht_er_open'};
+async function loadHT(){
+  let r;try{r=await api().get_health_tools()}catch(e){r={tools:[],winget:true}}
+  HTL=r.tools||[];HTW=r.winget;htLoaded=true;renderHT();
+}
+function htReady(){return HTL.length>0&&HTL.filter(t=>!t.builtin).every(t=>t.installed)}
+function htNote(t){$('htnote').textContent=t||''}
+function renderHT(){
+  if(!htLoaded)return;
+  const ready=htReady(),cur=ready?2:1;
+  $('hts').innerHTML=[1,2,3].map(n=>`<span class="badge ${n<cur?'safe':n===cur?'caution':'mut'}">${L('ht_s'+n)}</span>`).join('');
+  $('htmsg').textContent=L(ready?'ht_stage2_msg':'ht_stage1_msg')+(HTW?'':' '+L('no_winget'));
+  const missing=HTL.filter(t=>!t.builtin&&!t.installed).length;
+  const ia=$('htall');ia.style.display=missing&&HTW?'':'none';ia.disabled=htBusy;$('htre').disabled=htBusy;
+  $('htlist').innerHTML=HTL.map(t=>{
+    const k=t.key,dis=htBusy?'disabled':'';
+    const badge=t.builtin?`<span class="badge mut">${L('ht_builtin')}</span>`:t.installed?`<span class="badge safe">${L('ht_inst')}</span>`:`<span class="badge caution">${L('ht_notinst')}</span>`;
+    const inst=!t.builtin&&!t.installed&&HTW?`<button class="ghost" ${dis} onclick="htInstall('${k}')">${L('ht_install')}</button>`:'';
+    let body='';
+    if(ready){
+      const steps=L('ht_st_'+k).split('|').map(x=>`<li>${esc(x)}</li>`).join('');
+      let acts='',got='';
+      if(t.kind==='event'){
+        acts=`<button class="ghost" onclick="htOpen('${k}')">${L('ht_memrun')}</button><button class="ghost" onclick="htMemRead()">${L('ht_memread')}</button>`;
+        got=t.got?L(t.got.state==='pass'?'ht_mem_pass':'ht_mem_fail',t.got.when):L('ht_not_got');
+      }else{
+        acts=(t.has_exe?`<button class="ghost" onclick="htOpen('${k}')">${L('ht_open')}</button>`:'')+`<button class="ghost" onclick="htPick('${k}')">${L('ht_pick')}</button><button class="ghost" onclick="htPasteOpen('${k}')">${L('ht_paste')}</button>`;
+        const kb=t.got?Math.max(1,Math.round(t.got.size/1024)):0;
+        got=t.got?(t.got.name?L('ht_got',t.got.name,kb):L('ht_got_paste',kb)):L('ht_not_got');
+      }
+      const clr=t.got&&t.kind!=='event'?`<button class="ghost" onclick="htClear('${k}')">${L('ht_clear')}</button>`:'';
+      body=`<div class="inf" style="flex-basis:100%"><ol style="margin:6px 0 8px;padding-inline-start:20px;font-size:13px;line-height:1.7">${steps}</ol><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${acts}${clr}<small>${esc(got)}</small></div></div>`;
+    }
+    return `<div class="card ${t.installed?'safe':'caution'}" style="flex-wrap:wrap"><div class="inf"><b>${L('ht_n_'+k)}</b><small>${esc(L('ht_w_'+k))}</small></div>${badge}${inst}${body}</div>`;
+  }).join('')+(ready?`<div class="card safe"><div class="inf"><small>${L('ht_stage3')}</small></div><span class="badge mut">${L('soon')}</span></div>`:'');
+}
+async function htInstall(key){
+  if(htBusy)return;htBusy=true;renderHT();htNote(L('ht_installing'));
+  let r;try{r=await api().ht_install(key)}catch(e){r={state:'fail',code:'error'}}
+  htBusy=false;await loadHT();
+  htNote(r.state==='fail'?(r.code==='no-winget'?L('no_winget'):errText(r.code,'er_generic')):'');
+}
+async function htInstallAll(){
+  if(htBusy)return;
+  const todo=HTL.filter(t=>!t.builtin&&!t.installed);if(!todo.length)return;
+  htBusy=true;renderHT();let bad='';
+  for(let i=0;i<todo.length;i++){
+    htNote(L('installing',L('ht_n_'+todo[i].key),i+1,todo.length));
+    let r;try{r=await api().ht_install(todo[i].key)}catch(e){r={state:'fail',code:'error'}}
+    if(r.state==='fail')bad=r.code==='no-winget'?L('no_winget'):errText(r.code,'er_generic');
+  }
+  htBusy=false;await loadHT();htNote(bad);
+}
+async function htOpen(key){
+  let r;try{r=await api().ht_open(key)}catch(e){r={ok:false,code:'not-found'}}
+  htNote(r.ok?'':L('ht_er_open'));
+}
+function htErr(code){return code==='cancel'?'':L(HTER[code]||'er_generic')}
+async function htPick(key){
+  let r;try{r=await api().ht_pick_file(key)}catch(e){r={ok:false,code:'dialog'}}
+  if(r.ok){await loadHT();htNote(L('ht_saved'))}else htNote(htErr(r.code));
+}
+function htPasteOpen(key){
+  showM(`<h3>${L('ht_paste_title')}</h3><p class="lbl">${L('ht_paste_hint')}</p><textarea id="htpt" style="width:100%;height:220px;direction:ltr;font-family:monospace;font-size:12px"></textarea><div class="row"><button class="pri" onclick="htPasteSave('${key}')">${L('ht_paste_save')}</button><button class="ghost" onclick="closeM()">${L('cancel')}</button></div>`);
+  setTimeout(()=>{const e=$('htpt');if(e)e.focus()},50);
+}
+async function htPasteSave(key){
+  const txt=$('htpt')?$('htpt').value:'';
+  let r;try{r=await api().ht_paste(key,txt)}catch(e){r={ok:false,code:'read'}}
+  closeM();
+  if(r.ok){await loadHT();htNote(L('ht_saved'))}else htNote(htErr(r.code));
+}
+async function htClear(key){try{await api().ht_clear(key)}catch(e){}await loadHT();htNote('')}
+async function htMemRead(){
+  let r;try{r=await api().ht_memdiag()}catch(e){r={state:'unknown'}}
+  await loadHT();
+  htNote(L('ht_mem_'+(r.state||'unknown'),r.when||''));
+}
+
 /* ---- refresh everything that is already loaded ---- */
 async function refApps(){
   const r=await api().get_apps();WG=r.winget;const w=$('wg');
@@ -3184,6 +3468,7 @@ async function refreshAll(){
     if(uwpLoaded)jobs.push(loadUwp());
     if(tweaksLoaded)jobs.push(loadTweaks());
     if(doctorLoaded)jobs.push(loadDoctor());
+    if(htLoaded&&!htBusy)jobs.push(loadHT());
     await Promise.all(jobs);
     $('refl').textContent=L('ref_done',new Date().toLocaleTimeString());
   }catch(e){}
