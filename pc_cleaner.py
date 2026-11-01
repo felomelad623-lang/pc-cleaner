@@ -40,7 +40,7 @@ REPARSE_POINT = 0x400  # junctions / symlinks: we never enter them
 FORBIDDEN = ("\\windows\\prefetch", "\\windows\\winsxs", "pagefile.sys", "hiberfil.sys")
 
 # ---- Update settings: put YOUR GitHub username and repository name here ----
-VERSION = "3.6"
+VERSION = "3.6.1"
 GITHUB_USER = "felomelad623-lang"
 GITHUB_REPO = "pc-cleaner"
 UPDATES_ENABLED = "YOUR_" not in GITHUB_USER + GITHUB_REPO
@@ -2051,6 +2051,9 @@ def ht_memdiag_read():
     return {"state": "none", "when": ""}
 
 
+DR_SECS = ("quick", "sys", "tools")  # Doctor-tab sections the user can fold
+
+
 class Api:
     """Functions the web page can call. The page never sends file paths, only section names / list numbers."""
 
@@ -2276,7 +2279,8 @@ class Api:
         p = prefs_load()
         return {"lang": p.get("lang") if p.get("lang") in ("ar", "en") else default_lang(),
                 "theme": p.get("theme") if p.get("theme") in ("light", "dark") else "",
-                "collapsed": bool(p.get("collapsed", False))}
+                "collapsed": bool(p.get("collapsed", False)),
+                "dr_closed": [x for x in p.get("dr_closed", []) if x in DR_SECS] if isinstance(p.get("dr_closed", []), list) else []}
 
     def set_pref(self, key, value):
         p = prefs_load()
@@ -2289,6 +2293,8 @@ class Api:
                 pass
         elif key == "collapsed" and isinstance(value, bool):
             p["collapsed"] = value
+        elif key == "dr_closed" and isinstance(value, list) and all(isinstance(x, str) for x in value):
+            p["dr_closed"] = [x for x in dict.fromkeys(value) if x in DR_SECS]
         else:
             return False
         prefs_save(p)
@@ -2572,6 +2578,16 @@ main::-webkit-scrollbar{width:8px}main::-webkit-scrollbar-thumb{background:var(-
 @keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:16px}
 .head h1{margin:0 0 4px;font-size:23px}
+.hl{display:flex;gap:10px;align-items:flex-start}
+.cv{flex:none;width:32px;height:32px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:9px;background:transparent;color:var(--mut);border:1px solid var(--line);cursor:pointer}
+.cv:hover{background:var(--line)}
+.cv svg{transition:transform .2s}
+.shead{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+.shead h2{margin:0;font-size:19px;cursor:pointer}
+.sec .hl h1{cursor:pointer}
+.sec.closed .cv svg{transform:rotate(-90deg)}
+html[dir=rtl] .sec.closed .cv svg{transform:rotate(90deg)}
+.sec.closed>.cbody{display:none}
 .lbl{color:var(--mut);font-size:13px}
 button{font:inherit;border:0;border-radius:12px;padding:10px 18px;cursor:pointer;transition:transform .15s,background .15s,filter .15s,border-color .15s,box-shadow .15s}
 button:not(:disabled):hover{transform:translateY(-1px)}
@@ -2753,17 +2769,28 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--vi);outline-off
 <section class="pane" id="p5">
   <div class="head"><div><h1 data-i="dr_title"></h1><div class="lbl" data-i="dr_sub"></div></div><button class="pri" id="drgo" onclick="loadDoctor()" data-i="dr_scan"></button></div>
   <div class="stat" id="drsum" style="display:none;margin-bottom:14px"></div>
-  <div id="drlist"></div>
-  <div class="head" style="margin-top:26px"><div><h1 style="font-size:19px" data-i="sc_title"></h1><div class="lbl" data-i="sc_sub"></div></div><div style="display:flex;gap:8px"><button class="pri" id="scgo" onclick="startSys()" data-i="sc_start"></button><button class="ghost" id="sccancel" onclick="cancelSys()" style="display:none" data-i="sc_cancel"></button></div></div>
+  <div class="sec" id="sec-quick">
+  <div class="shead"><button class="cv" type="button" onclick="toggleSec('quick')" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><h2 data-i="dr_quick_title" onclick="toggleSec('quick')"></h2></div>
+  <div class="cbody"><div id="drlist"></div></div>
+  </div>
+  <div class="sec" id="sec-sys">
+  <div class="head" style="margin-top:26px"><div class="hl"><button class="cv" type="button" onclick="toggleSec('sys')" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div><h1 style="font-size:19px" data-i="sc_title" onclick="toggleSec('sys')"></h1><div class="lbl" data-i="sc_sub"></div></div></div><div style="display:flex;gap:8px"><button class="pri" id="scgo" onclick="startSys()" data-i="sc_start"></button><button class="ghost" id="sccancel" onclick="cancelSys()" style="display:none" data-i="sc_cancel"></button></div></div>
+  <div class="cbody">
   <div id="scprog" style="display:none"><div class="lbl" id="sctxt"></div><div class="pbar"><i></i></div></div>
   <div class="lbl" id="scmsg" style="margin-bottom:8px"></div>
   <div id="sclist"></div>
-  <div class="head" style="margin-top:26px"><div><h1 style="font-size:19px" data-i="ht_title"></h1><div class="lbl" data-i="ht_sub"></div></div><div style="display:flex;gap:8px"><button class="pri" id="htall" onclick="htInstallAll()" style="display:none" data-i="ht_install_all"></button><button class="ghost" id="htre" onclick="loadHT()" data-i="ht_recheck"></button></div></div>
+  </div>
+  </div>
+  <div class="sec" id="sec-tools">
+  <div class="head" style="margin-top:26px"><div class="hl"><button class="cv" type="button" onclick="toggleSec('tools')" aria-expanded="true"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div><h1 style="font-size:19px" data-i="ht_title" onclick="toggleSec('tools')"></h1><div class="lbl" data-i="ht_sub"></div></div></div><div style="display:flex;gap:8px"><button class="pri" id="htall" onclick="htInstallAll()" style="display:none" data-i="ht_install_all"></button><button class="ghost" id="htre" onclick="loadHT()" data-i="ht_recheck"></button></div></div>
+  <div class="cbody">
   <div id="hts" style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap"></div>
   <div class="lbl" id="htmsg" style="margin-bottom:6px"></div>
   <div class="lbl" id="htnote" style="margin-bottom:8px;font-weight:600"></div>
   <div id="htlist"></div>
   <div class="lbl" style="margin-top:6px" data-i="ht_privacy"></div>
+  </div>
+  </div>
 </section>
 
 <section class="pane" id="p4">
@@ -2833,6 +2860,7 @@ dr_def_ok:'الحماية شغّالة وقواعد الفحص محدّثة (ع�
 dr_rp_ok:'نقاط الاستعادة مفعّلة.',dr_rp_off:'نقاط الاستعادة مقفولة، يعني لو حاجة باظت مفيش نقطة ترجع لها. فعّلها من الإعدادات.',dr_rp_unknown:'معرفتش أتأكد من نقاط الاستعادة.',
 dr_bat_ok:'البطارية محتفظة بـ {0}% من سعتها الأصلية. كويسة.',dr_bat_warn:'البطارية محتفظة بـ {0}% من سعتها بس. ضعفت شوية وهتفصل أسرع.',dr_bat_bad:'البطارية محتفظة بـ {0}% من سعتها بس. ضعيفة جداً، فكّر تبدّلها.',dr_bat_unknown:'معرفتش أقرا صحة البطارية على الجهاز ده.',
 sc_title:'فحص ملفات ويندوز',sc_sub:'بيشغّل أهم فحوصات ويندوز واحد ورا التاني. الفحص بيقرا بس ومبيغيّرش حاجة، وممكن ياخد من 10 لـ 30 دقيقة، فسيب الجهاز شغّال.',sc_start:'ابدأ الفحص',sc_cancel:'إلغاء',sc_running:'جاري الفحص ({0} من {1}): {2}',sc_cancelled:'الفحص اتلغى.',sc_admin:'الفحص ده محتاج تشغّل البرنامج بصلاحية مدير.',sc_busy:'فيه فحص شغّال بالفعل.',sc_fix:'صلّحها',sc_note_done:'خلص الفحص.',sc_none:'مفيش نتايج لسه. اضغط ابدأ الفحص.',
+dr_quick_title:'الفحص السريع للجهاز',sec_toggle:'إظهار / إخفاء القسم',
 sc_t_sfc:'ملفات النظام (SFC)',sc_t_dism:'مخزن مكونات ويندوز (DISM)',sc_t_disk:'أخطاء القرص (CHKDSK)',sc_t_wmi:'قاعدة بيانات الإدارة (WMI)',sc_t_events:'الأخطاء الحرجة في ويندوز',
 sc_cur_sfc:'فحص ملفات النظام',sc_cur_dism_check:'فحص سريع لمخزن المكونات',sc_cur_dism_scan:'فحص كامل لمخزن المكونات',sc_cur_disk:'فحص القرص',sc_cur_wmi:'فحص قاعدة بيانات WMI',sc_cur_events:'قراءة سجل الأحداث',sc_cur_fix_sfc:'إصلاح ملفات النظام',sc_cur_fix_dism:'إصلاح مخزن المكونات',sc_cur_rp:'عمل نقطة استعادة',
 sc_fix_conf_sfc:'هيشغّل إصلاح ملفات النظام. ممكن ياخد من 10 لـ 30 دقيقة، ومتقفلش البرنامج في الأثناء. نكمّل؟',sc_fix_conf_dism:'هيشغّل إصلاح مخزن مكونات ويندوز. محتاج إنترنت وممكن ياخد من 10 لـ 30 دقيقة، ومتقفلش البرنامج في الأثناء. نكمّل؟',sc_rp_ask:'تعمل نقطة استعادة قبل الإصلاح؟ (موصى بيه)\nموافق = أيوه اعمل نقطة، إلغاء = لأ كمّل من غيرها',sc_dism_first:'لو الاتنين فيهم مشكلة، صلّح مخزن المكونات (DISM) الأول وبعدين ارجع لملفات النظام.',
@@ -2916,6 +2944,7 @@ dr_def_ok:'Protection is on and up to date (signatures are {0} days old).',dr_de
 dr_rp_ok:'Restore points are on.',dr_rp_off:'Restore points are off, so if something breaks there is nothing to roll back to. Turn them on in Settings.',dr_rp_unknown:'Could not check restore points.',
 dr_bat_ok:'The battery keeps {0}% of its original capacity. Good.',dr_bat_warn:'The battery keeps only {0}% of its capacity. It has weakened and will drain faster.',dr_bat_bad:'The battery keeps only {0}% of its capacity. It is very weak; consider replacing it.',dr_bat_unknown:'Could not read the battery health on this PC.',
 sc_title:'Windows files check',sc_sub:'Runs the main Windows health checks one after another. The check only reads and changes nothing. It can take 10 to 30 minutes, so leave the PC on.',sc_start:'Start the check',sc_cancel:'Cancel',sc_running:'Checking ({0} of {1}): {2}',sc_cancelled:'The check was cancelled.',sc_admin:'This check needs the app to run as Administrator.',sc_busy:'A check is already running.',sc_fix:'Fix it',sc_note_done:'The check is done.',sc_none:'No results yet. Press Start the check.',
+dr_quick_title:'Quick device check',sec_toggle:'Show / hide this section',
 sc_t_sfc:'System files (SFC)',sc_t_dism:'Windows component store (DISM)',sc_t_disk:'Disk errors (CHKDSK)',sc_t_wmi:'Management database (WMI)',sc_t_events:'Critical Windows errors',
 sc_cur_sfc:'Checking system files',sc_cur_dism_check:'Quick check of the component store',sc_cur_dism_scan:'Full check of the component store',sc_cur_disk:'Checking the disk',sc_cur_wmi:'Checking the WMI database',sc_cur_events:'Reading the event log',sc_cur_fix_sfc:'Repairing system files',sc_cur_fix_dism:'Repairing the component store',sc_cur_rp:'Creating a restore point',
 sc_fix_conf_sfc:'This will repair system files. It can take 10 to 30 minutes, and you should not close the app meanwhile. Continue?',sc_fix_conf_dism:'This will repair the Windows component store. It needs the internet and can take 10 to 30 minutes, and you should not close the app meanwhile. Continue?',sc_rp_ask:'Create a restore point before the repair? (recommended)\nOK = yes, make one. Cancel = no, continue without it',sc_dism_first:'If both have a problem, fix the component store (DISM) first, then come back to the system files.',
@@ -2983,7 +3012,7 @@ function applyLang(){
   if(appsLoaded)renderApps();
   if(tweaksLoaded){renderTweaks();showPend()}
   if(doctorLoaded)renderDoctor();
-  renderSys();renderHT();
+  renderSys();renderHT();applySec();
 }
 function toggleLang(){LANG=LANG==='ar'?'en':'ar';applyLang();api().set_pref('lang',LANG)}
 function curTheme(){const a=document.documentElement.getAttribute('data-theme');if(a)return a;return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}
@@ -3327,15 +3356,30 @@ function renderDoctor(){
   }).join('')+`<div class="card safe"><div class="inf"><b>${L('dr_t_temp')}</b><small>${L('dr_temp_soon')}</small></div><span class="badge mut">${L('soon')}</span></div>`;
 }
 
+/* ---- Collapsible sections in the Doctor tab ---- */
+const SECS=['quick','sys','tools'];let SECC=new Set();
+function applySec(){
+  SECS.forEach(id=>{
+    const e=$('sec-'+id);if(!e)return;
+    const c=SECC.has(id);e.classList.toggle('closed',c);
+    const b=e.querySelector('.cv');if(b){b.setAttribute('aria-expanded',c?'false':'true');b.title=L('sec_toggle')}
+  });
+}
+function saveSec(){try{api().set_pref('dr_closed',[...SECC])}catch(e){}}
+function toggleSec(id){if(!SECS.includes(id))return;SECC.has(id)?SECC.delete(id):SECC.add(id);applySec();saveSec()}
+function openSec(id){if(SECC.has(id)){SECC.delete(id);applySec();saveSec()}}
+
 /* ---- Windows files check ---- */
 let SC=[],scTimer=null,scLast=null;
 function scErr(c){$('scmsg').textContent=c==='admin'?L('sc_admin'):c==='busy'?L('sc_busy'):''}
 async function startSys(){
+  openSec('sys');
   let r;try{r=await api().start_syscheck()}catch(e){r={ok:false}}
   if(!r.ok){scErr(r.code);return}
   $('scmsg').textContent='';SC=[];pollSys();
 }
 async function fixSys(key){
+  openSec('sys');
   if(!confirm(L('sc_fix_conf_'+key)))return;
   const rp=confirm(L('sc_rp_ask'));
   let r;try{r=await api().start_syscheck_fix(key,rp)}catch(e){r={ok:false}}
@@ -3416,6 +3460,7 @@ async function htInstall(key){
   htNote(r.state==='fail'?(r.code==='no-winget'?L('no_winget'):errText(r.code,'er_generic')):'');
 }
 async function htInstallAll(){
+  openSec('tools');
   if(htBusy)return;
   const todo=HTL.filter(t=>!t.builtin&&!t.installed);if(!todo.length)return;
   htBusy=true;renderHT();let bad='';
@@ -3481,7 +3526,7 @@ async function doUpdate(){
 }
 themeLabel();
 window.addEventListener('pywebviewready',async()=>{
-  try{const p=await api().get_prefs();LANG=p.lang==='en'?'en':'ar';if(p.theme)setTheme(p.theme,false);setSide(!!p.collapsed,false)}catch(e){}
+  try{const p=await api().get_prefs();LANG=p.lang==='en'?'en':'ar';if(p.theme)setTheme(p.theme,false);setSide(!!p.collapsed,false);SECC=new Set((p.dr_closed||[]).filter(x=>SECS.includes(x)));applySec()}catch(e){}
   applyLang();
   api().get_home().then(h=>{H=h;renderHome()}).catch(()=>{});
   load();
